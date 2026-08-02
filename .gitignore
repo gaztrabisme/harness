@@ -1,0 +1,15 @@
+/target
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/*.db-journal
+.DS_Store
+.claude/
+.harness/
+
+# Local provider registry (machine-specific; example is providers.example.toml)
+providers.toml
+
+# Python bytecode (dogfood katas + any agent-produced churn)
+__pycache__/
+*.pyc

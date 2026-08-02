@@ -1,0 +1,35 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+# Mirrors exactly the workspace keys pi-iso inherits via `*.workspace = true`,
+# so pi-iso is lifted from oh-my-pi with ZERO source/manifest edits — the
+# strongest proof of DR1's "cleanly severable" claim (Phase 0 criterion #5).
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"                                   # pi-iso is MIT (Zechner + Bölük); see crates/pi-iso NOTICE
+authors = ["Gary"]
+repository = "local-spike"
+
+# Empty on purpose: pi-iso's `[lints] workspace = true` needs the key present,
+# but we don't inherit oh-my-pi's pedantic/nursery clippy gate onto the spike.
+[workspace.lints.rust]
+[workspace.lints.clippy]
+
+[workspace.dependencies]
+# pi-iso's deps (versions copied from oh-my-pi workspace)
+async-trait = "0.1"
+similar = "3.1.0"
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+parking_lot = "0.12.5"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+# spike deps (added as crates land)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+futures-util = "0.3"
+anyhow = "1"

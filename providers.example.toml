@@ -1,0 +1,41 @@
+# Provider registry (example) — copy to `providers.toml` to activate.
+#
+# The harness picks the backend for a landing `run` from this file plus two env vars:
+#   HARNESS_PROVIDER  — section name to use (default: omlx)
+#   HARNESS_MODEL     — override the model for the chosen provider (optional)
+# Config path override: HARNESS_PROVIDERS_CONFIG=/path/to/file.toml
+#
+# With NO providers.toml present, the built-in defaults apply unchanged:
+#   omlx     → local oMLX  (default)
+#   deepseek → deepseek-v4-pro   (needs DEEPSEEK_API_KEY)
+# So this file is only needed to add a NEW endpoint or override a default.
+#
+# Adding an endpoint of a dialect the harness already speaks (omlx | deepseek |
+# anthropic) is config-only — zero recompile. A genuinely new wire format is the
+# only thing that needs a new Provider impl in the `provider` crate.
+#
+# Rules (the parser is strict and fails loudly on anything else):
+#   - `key_env` is the NAME of an env var holding the API key — NEVER an inline key.
+#   - every section needs all four keys: base_url, key_env, model, dialect.
+#   - values are double-quoted; comments are on their own line (not trailing).
+
+# A second oMLX-compatible endpoint (e.g. a remote box running the same server).
+[omlx-remote]
+base_url = "http://100.106.185.34:8000/v1"
+key_env = "OMLX_REMOTE_KEY"
+model = "Qwen3.6-35B-A3B-oQ8-fp16-mtp"
+dialect = "omlx"
+
+# DeepSeek's cheaper/faster tier (the built-in `deepseek` drives v4-pro).
+[deepseek-flash]
+base_url = "https://api.deepseek.com"
+key_env = "DEEPSEEK_API_KEY"
+model = "deepseek-v4-flash"
+dialect = "deepseek"
+
+# Anthropic via the messages dialect.
+[claude]
+base_url = "https://api.anthropic.com/v1"
+key_env = "ANTHROPIC_API_KEY"
+model = "claude-opus-4-8"
+dialect = "anthropic"
