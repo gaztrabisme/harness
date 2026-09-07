@@ -643,7 +643,7 @@ machinery the park-at-Align already enforces.
 **Evidence:** 21 unit tests (board: render — all 5 sections in order + header + 3 placeholders; notes/confusions
 persist + audit ×2. agent: confusion bounces in_progress→align and flips `gate_allows(write_file)` to false / todo
 just records; system_prompt embeds the rendered workpad incl. all 5 sections + header), `cargo test --workspace`
-green, clippy clean, **live `agent show`** (full §5 render, header `McBob.local:/private/tmp/…@ecd7bdc`) and the
+green, clippy clean, **live `agent show`** (full §5 render, header `<host>:/private/tmp/…@ecd7bdc`) and the
 **confusion bounce** (in_progress→align; `show` reflects status + recorded text).
 **Deferred (logged known-holes):** reconcile-first-on-entry (a Verify/Review behavior); **agent-raised** confusions
 (needs a 4th tool / structured stop — the loop's tools are read/write/bash only, so confusions are CLI-raised for

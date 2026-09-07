@@ -59,6 +59,14 @@ no success reported without evidence.
 - `skills/harness-operator/` — a Claude Code skill that makes a CC session the conversational
   front-end: you speak intent, the session runs the verbs, keystones come back as explicit questions.
 
+## Build
+
+```bash
+cargo build --release -p agent
+```
+
+The binary lands at `target/release/agent` (`target/release/agent.exe` on Windows).
+
 ## Setup
 
 ```bash

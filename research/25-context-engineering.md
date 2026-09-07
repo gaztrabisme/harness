@@ -189,7 +189,7 @@ plain text cross-provider, stripped during compaction. → **validates our recor
 
 **(e) Subagents** (`tool/task.ts`): `task{description,prompt,subagent_type}` spawns an **isolated child session**
 (own window, derived permissions, optional background, resumable). Built-ins: `build`/`plan`/`explore`/`compaction`.
-The `explore` read-only subagent is what processes the disk-offloaded truncation files — keeping the parent window clean.
+The `explore` read-only subagent is what processes the disk offloaded truncation files — keeping the parent window clean.
 
 **Honest finding (worker's gap analysis):** OpenCode *also* has **no semantic curation** — its working set is purely
 recency-based (token count is the only signal). It hasn't "solved" context engineering; **compaction + truncate-to-disk

@@ -3,6 +3,9 @@
 //!  - `edge` PK carries `kind` → a pair can be both parent-child AND blocks (C1 #1).
 //!  - `gate_results` PK carries `attempt` + a `source` col → rework invalidates
 //!    prior passes, and human gates can't be machine-cleared (C1 #4, C3 #1/#2).
+//!    (v3 replaces that PK with an autoincrement `seq` — see the migration below:
+//!    the key made every re-report OVERWRITE the verdict it fixed, so no red gate
+//!    ever survived on any board.)
 //!  - `event` is append-only → the JSONL export is a history, not a state dump (C1 #7).
 //!
 //! On top of the v0 baseline sits a `user_version` migrator (research/17 §8 M1):
@@ -10,6 +13,10 @@
 //! evolution needs a ratchet, not just idempotent DDL. `init` also sets WAL + a
 //! busy_timeout (M3) so the coordinator's parallel writers don't drop rows.
 //! Migration v1 adds the telemetry `run` table.
+//!
+//! The `SCHEMA` constant below is the FROZEN v0 baseline — it is the historical
+//! starting point every migration steps forward from, not a description of the
+//! current shape. Read `MIGRATIONS` for what the tables look like today.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -145,6 +152,47 @@ const MIGRATIONS: &[&str] = &[
 	    INSERT INTO memory_fts(rowid, title, body, entities)
 	    VALUES (new.rowid, new.title, new.body, new.entities);
 	END;",
+	// v3 — gate_results becomes APPEND-ONLY. The v0 key
+	// (issue_id, gate, provider, attempt) + `ON CONFLICT DO UPDATE` meant the
+	// re-run that FIXED a gate landed on the same row and erased the failure that
+	// caused it: across every board on this machine, 112 gate reports had left
+	// exactly ZERO surviving `passed = 0` rows. `attempt` doesn't save it — it
+	// bumps only on entry to Rework, and no red gate causes a rework (harden below
+	// threshold prints and returns; verify-red bounces Verify→InProgress; the
+	// oracle bails with no transition). So the fix is the key: `seq` autoincrement,
+	// one row per report, nothing ever overwritten.
+	//
+	// This also repairs `created_at`, which under the upsert carried the FIRST
+	// report's timestamp beside the LAST report's verdict.
+	//
+	// A PK swap cannot be an ALTER, so this is create-new / INSERT..SELECT / DROP /
+	// rename — which is exactly why `migrate` had to become transactional first: a
+	// crash between DROP and rename would lose the table outright. The copy is
+	// ordered by `rowid` (insert order, and the only integer key the old table has)
+	// and carries `created_at` across verbatim, so banked history keeps its stamps.
+	"CREATE TABLE gate_results_v3 (
+	    seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+	    issue_id  TEXT NOT NULL,
+	    gate      TEXT NOT NULL,
+	    provider  TEXT NOT NULL,
+	    source    TEXT NOT NULL CHECK (source IN ('human','machine')),
+	    attempt   INTEGER NOT NULL,
+	    passed    INTEGER NOT NULL CHECK (passed IN (0, 1)),
+	    note      TEXT,
+	    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
+
+	INSERT INTO gate_results_v3
+	       (issue_id, gate, provider, source, attempt, passed, note, created_at)
+	SELECT  issue_id, gate, provider, source, attempt, passed, note, created_at
+	  FROM gate_results ORDER BY rowid;
+
+	DROP TABLE gate_results;
+
+	ALTER TABLE gate_results_v3 RENAME TO gate_results;
+
+	CREATE INDEX IF NOT EXISTS gate_results_lookup
+	    ON gate_results (issue_id, gate, attempt);",
 ];
 
 /// Create the base schema, tune connection pragmas, and apply pending migrations.
@@ -163,10 +211,88 @@ pub fn init(conn: &Connection) -> Result<()> {
 fn migrate(conn: &Connection) -> Result<()> {
 	let mut version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
 	while (version as usize) < MIGRATIONS.len() {
-		conn.execute_batch(MIGRATIONS[version as usize])
-			.with_context(|| format!("applying migration v{}", version + 1))?;
+		apply_migration(conn, MIGRATIONS[version as usize], version + 1)?;
 		version += 1;
-		conn.pragma_update(None, "user_version", version).context("bumping user_version")?;
 	}
 	Ok(())
+}
+
+/// Apply ONE migration and its `user_version` bump as a single transaction.
+///
+/// v1 and v2 were purely additive (`CREATE TABLE IF NOT EXISTS`), so running the
+/// DDL and the version bump as two separate autocommit units was survivable — a
+/// crash between them just re-ran an idempotent batch. v3 rebuilds a table
+/// (create / copy / DROP / rename), where a crash between statements loses the
+/// table and a crash before the bump re-runs the rebuild against a table that no
+/// longer has the old shape. So the batch and the bump commit together or not at
+/// all. `PRAGMA user_version` writes the database header, which is transactional
+/// like any other page, so it rolls back with the batch.
+fn apply_migration(conn: &Connection, sql: &str, target: i64) -> Result<()> {
+	conn.execute_batch("BEGIN IMMEDIATE;").context("opening the migration transaction")?;
+	let applied = conn
+		.execute_batch(sql)
+		.with_context(|| format!("applying migration v{target}"))
+		.and_then(|()| {
+			conn.pragma_update(None, "user_version", target).context("bumping user_version")
+		});
+	match applied {
+		Ok(()) => {
+			conn.execute_batch("COMMIT;").context("committing the migration transaction")?;
+			Ok(())
+		}
+		Err(e) => {
+			// Best-effort rollback: if this fails the transaction is already gone
+			// (SQLite auto-rolled it back), and `e` is the failure worth reporting.
+			let _ = conn.execute_batch("ROLLBACK;");
+			Err(e)
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// A migration is all-or-nothing (the v3 prerequisite): a batch that does real
+	// work and THEN fails — the shape of a table rebuild that dies after its
+	// `DROP TABLE` — must leave the version untouched AND the prior schema intact,
+	// so the next open re-runs the same step against the same starting state.
+	#[test]
+	fn a_failing_migration_commits_nothing() {
+		let conn = Connection::open_in_memory().unwrap();
+		init(&conn).unwrap();
+		let before: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+		conn.execute(
+			"INSERT INTO gate_results (issue_id, gate, provider, source, attempt, passed)
+			 VALUES ('t1', 'tests_green', 'bash', 'machine', 0, 1)",
+			[],
+		)
+		.unwrap();
+
+		let err = apply_migration(
+			&conn,
+			"CREATE TABLE half_applied (x);
+			 DROP TABLE gate_results;
+			 THIS IS NOT SQL;",
+			before + 1,
+		)
+		.unwrap_err();
+		assert!(format!("{err:#}").contains("applying migration"), "the failure is reported");
+
+		let after: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+		assert_eq!(after, before, "a failed migration does not advance user_version");
+
+		let tables: i64 = conn
+			.query_row(
+				"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='half_applied'",
+				[],
+				|r| r.get(0),
+			)
+			.unwrap();
+		assert_eq!(tables, 0, "the half-applied statement rolled back");
+
+		let rows: i64 =
+			conn.query_row("SELECT COUNT(*) FROM gate_results", [], |r| r.get(0)).unwrap();
+		assert_eq!(rows, 1, "the dropped table (and its rows) came back with the rollback");
+	}
 }

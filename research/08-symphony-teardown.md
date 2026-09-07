@@ -1,6 +1,6 @@
 # Symphony Elixir Teardown (implementation mechanics)
 
-Source clone: `/Users/GaryT/Documents/Work/Skills/symphony` (openai/symphony, shallow). All paths below are repo-relative under `elixir/lib/` unless noted. The orchestrator is a single 1951-line GenServer; that file is where ~90% of the spine lives.
+Source clone: `$HOME/Documents/Work/Skills/symphony` (openai/symphony, shallow). All paths below are repo-relative under `elixir/lib/` unless noted. The orchestrator is a single 1951-line GenServer; that file is where ~90% of the spine lives.
 
 ## What this adds beyond 02-orchestration-spine.md
 
@@ -230,14 +230,14 @@ All three are AND-ed in `should_dispatch_issue?`. Because counting is derived fr
 
 ## Sources (file paths read)
 
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/orchestrator.ex` (full, 1951 lines — the tick, claim layer, stall/retry, reconcile, concurrency, dispatch)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/workspace.ex` (lifecycle hooks, path validation, remote-vs-local create/remove)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/path_safety.ex` (symlink-resolving canonicalize)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/agent_runner.ex` (worker lifecycle, continuation turns, hook ordering)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/codex/app_server.ex` (l.147-223: second cwd validation + codex port launch with cd)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/config/schema.ex` (all defaults/constants: concurrency, timeouts, stall, backoff, sandbox policy)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/tracker.ex` (the 5-callback tracker seam)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir.ex` (supervision tree — confirms no persistence)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/workflow_store.ex` (config cache, not state)
-- `/Users/GaryT/Documents/Work/Skills/symphony/.codex/skills/land/SKILL.md` + `.codex/skills/land/land_watch.py` (land loop + async watcher, exit-code contract)
-- `/Users/GaryT/Documents/Work/Skills/symphony/elixir/WORKFLOW.md` (shipped work-model config: states, hooks, interval_ms=5000, max_concurrent=10, max_turns=20)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/orchestrator.ex` (full, 1951 lines — the tick, claim layer, stall/retry, reconcile, concurrency, dispatch)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/workspace.ex` (lifecycle hooks, path validation, remote-vs-local create/remove)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/path_safety.ex` (symlink-resolving canonicalize)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/agent_runner.ex` (worker lifecycle, continuation turns, hook ordering)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/codex/app_server.ex` (l.147-223: second cwd validation + codex port launch with cd)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/config/schema.ex` (all defaults/constants: concurrency, timeouts, stall, backoff, sandbox policy)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/tracker.ex` (the 5-callback tracker seam)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir.ex` (supervision tree — confirms no persistence)
+- `$HOME/Documents/Work/Skills/symphony/elixir/lib/symphony_elixir/workflow_store.ex` (config cache, not state)
+- `$HOME/Documents/Work/Skills/symphony/.codex/skills/land/SKILL.md` + `.codex/skills/land/land_watch.py` (land loop + async watcher, exit-code contract)
+- `$HOME/Documents/Work/Skills/symphony/elixir/WORKFLOW.md` (shipped work-model config: states, hooks, interval_ms=5000, max_concurrent=10, max_turns=20)

@@ -262,7 +262,7 @@ commit** (`git revert` = rollback). Instrument a **gate-bypass counter** as the 
 
 **Generalization filter** (accept a lesson only if all four hold): (a) cross-context transfer — would it have
 helped on a *different* project? (b) no bound specifics — names no file/repo/literal value; (c) evidence floor
-— ≥2 distinct episodes; (d) methodology form — phrased as mindset/heuristic, not task-instruction.
+— ≥2 distinct episodes; (d) methodology form — phrased as mindset/heuristic, not a task instruction.
 **Implementation = a two-column rewrite** ("specific observation" → "general principle"), **commit only the
 general column**; the specific stays in the episodic log.
 

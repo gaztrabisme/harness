@@ -4,9 +4,9 @@
 //! appends an audit event. Nothing mutates status except through here.
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
-use crate::model::{GateSource, Run, Status, Ticket, edge_kind_blocks};
+use crate::model::{GateReport, GateSource, Run, Status, Ticket, edge_kind_blocks};
 use crate::{schema, spine};
 
 pub struct Board {
@@ -223,6 +223,13 @@ impl Board {
 	/// Record a gate verdict at the ticket's current attempt. A human gate
 	/// (`criteria_confirmed`) REJECTS a machine source — an agent provider
 	/// cannot self-clear the Align gate (C3 #1).
+	///
+	/// APPEND-ONLY (schema v3): every report is its own row. The old key
+	/// `(issue_id, gate, provider, attempt)` + `ON CONFLICT DO UPDATE` meant the
+	/// re-run that fixed a gate overwrote the failure that motivated it, so a red
+	/// verdict never survived the green that followed it — and `attempt` did not
+	/// save it, because no red gate causes a rework. Nothing here overwrites now;
+	/// `gate_satisfied` decides which row is in force.
 	pub fn report_gate(
 		&self,
 		id: &str,
@@ -239,9 +246,7 @@ impl Board {
 		self.conn
 			.execute(
 				"INSERT INTO gate_results (issue_id, gate, provider, source, attempt, passed, note)
-				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-				 ON CONFLICT(issue_id, gate, provider, attempt)
-				 DO UPDATE SET source = excluded.source, passed = excluded.passed, note = excluded.note",
+				 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
 				params![id, gate, provider, source.as_str(), attempt, passed as i64, note],
 			)
 			.context("recording gate verdict")?;
@@ -249,8 +254,24 @@ impl Board {
 		Ok(())
 	}
 
-	/// Is `gate` satisfied for `id` at its current attempt? A satisfying row is
-	/// `passed = 1`, at this attempt, with the source class the gate demands.
+	/// Is `gate` satisfied for `id` at its current attempt? LATEST REPORT WINS:
+	/// among the rows at this attempt carrying the source class the gate demands,
+	/// take the newest row *per provider* and require every one of them to pass
+	/// (and at least one to exist).
+	///
+	/// Two things fall out of that, both deliberate:
+	///  - a re-run supersedes its own earlier verdict (`seq` order is commit
+	///    order), so the append-only history costs nothing at the gate: a red
+	///    followed by a green from the same provider reads satisfied, a green
+	///    followed by a red reads unsatisfied;
+	///  - a red from ONE provider is not cleared by a pass from ANOTHER. That
+	///    closes a live hole: `run_harden` reports `mutation_score` under the tool
+	///    name when it measures something and under `none` when the diff has
+	///    nothing to mutate, so a red cargo-mutants run followed by a vacuous
+	///    stamped pass used to read satisfied with the failure sitting right
+	///    beside it. Clearing it now takes a real re-run of the provider that
+	///    failed, or a rework (which bumps the attempt epoch).
+	///
 	/// Public + read-only so a caller can *require a prerequisite gate* (e.g.
 	/// `agent verify` refusing a code ticket that hasn't been hardened) without
 	/// attempting a transition and parsing the error string — gate by an
@@ -258,18 +279,64 @@ impl Board {
 	pub fn gate_satisfied(&self, id: &str, gate: &str) -> Result<bool> {
 		let attempt = self.get(id)?.attempt;
 		let need = spine::gate_source_required(gate);
-		let ok = self
-			.conn
-			.query_row(
-				"SELECT 1 FROM gate_results
-				  WHERE issue_id = ?1 AND gate = ?2 AND attempt = ?3
-				        AND passed = 1 AND source = ?4 LIMIT 1",
-				params![id, gate, attempt, need.as_str()],
-				|_| Ok(true),
-			)
-			.optional()?
-			.unwrap_or(false);
-		Ok(ok)
+		// `seq` (autoincrement = commit order), never `created_at`: the timestamp
+		// is second-resolution and same-second reports are routine.
+		let (providers, passing): (i64, i64) = self.conn.query_row(
+			"SELECT COUNT(*), COALESCE(SUM(passed), 0) FROM (
+			     SELECT g.passed FROM gate_results g
+			      WHERE g.issue_id = ?1 AND g.gate = ?2 AND g.attempt = ?3 AND g.source = ?4
+			        AND g.seq = (SELECT MAX(h.seq) FROM gate_results h
+			                      WHERE h.issue_id = g.issue_id AND h.gate = g.gate
+			                        AND h.attempt = g.attempt AND h.source = g.source
+			                        AND h.provider = g.provider)
+			 )",
+			params![id, gate, attempt, need.as_str()],
+			|r| Ok((r.get(0)?, r.get(1)?)),
+		)?;
+		Ok(providers > 0 && passing == providers)
+	}
+
+	/// Every gate report ever recorded for `id`, oldest first. The append-only
+	/// history `agent show` renders — including the reds that a later green
+	/// superseded, which is the whole point of the store.
+	pub fn gate_reports(&self, id: &str) -> Result<Vec<GateReport>> {
+		let mut stmt = self.conn.prepare(
+			"SELECT seq, gate, provider, source, attempt, passed, note, created_at
+			   FROM gate_results WHERE issue_id = ?1 ORDER BY seq ASC",
+		)?;
+		let rows = stmt
+			.query_map(params![id], |r| {
+				let source: String = r.get(3)?;
+				let passed: i64 = r.get(5)?;
+				Ok(GateReport {
+					seq: r.get(0)?,
+					gate: r.get(1)?,
+					provider: r.get(2)?,
+					source: source.parse().unwrap_or(GateSource::Machine),
+					attempt: r.get(4)?,
+					passed: passed != 0,
+					note: r.get(6)?,
+					created_at: r.get(7)?,
+				})
+			})?
+			.collect::<rusqlite::Result<Vec<_>>>()?;
+		Ok(rows)
+	}
+
+	/// How many FAILING gate reports stand at the ticket's current attempt —
+	/// the number the board/status one-liners carry so a red is visible without
+	/// knowing the history exists. Counts reports, not gates: a gate reported red
+	/// twice before it went green counts twice, because that is what happened.
+	/// Earlier attempts are excluded (a bumped `attempt` already says the ticket
+	/// was sent back).
+	pub fn red_gate_count(&self, id: &str) -> Result<i64> {
+		let attempt = self.get(id)?.attempt;
+		Ok(self.conn.query_row(
+			"SELECT COUNT(*) FROM gate_results
+			  WHERE issue_id = ?1 AND attempt = ?2 AND passed = 0",
+			params![id, attempt],
+			|r| r.get(0),
+		)?)
 	}
 
 	/// The required gates for `t.status -> to` that are NOT satisfied at the
@@ -519,6 +586,129 @@ mod tests {
 		b.append_notes("n3", "x").unwrap();
 		assert_eq!(b.event_count("n3").unwrap(), before + 1, "workpad edit audited");
 		assert!(b.append_notes("ghost", "x").is_err());
+	}
+
+	// THE DEFECT THIS SLICE EXISTS FOR (both directions). Under the old
+	// (issue, gate, provider, attempt) key + ON CONFLICT DO UPDATE, the second
+	// report of a gate LANDED ON THE SAME ROW and erased the first — so the re-run
+	// that fixed a gate destroyed the evidence of the failure it fixed. Now every
+	// report is a row and the LATEST one decides.
+	#[test]
+	fn a_red_gate_survives_the_green_re_run_that_fixed_it() {
+		let b = mem();
+		b.create_ticket("h1", "build", "harden twice", 2).unwrap();
+		clear_align(&b, "h1");
+
+		// red, then the green re-run of the SAME provider at the SAME attempt
+		b.report_gate("h1", GATE_MUTATION, "cargo-mutants", GateSource::Machine, false, Some("score=0.400"))
+			.unwrap();
+		b.report_gate("h1", GATE_MUTATION, "cargo-mutants", GateSource::Machine, true, Some("score=0.812"))
+			.unwrap();
+
+		let reports = b.gate_reports("h1").unwrap();
+		let mutation: Vec<_> = reports.iter().filter(|r| r.gate == GATE_MUTATION).collect();
+		assert_eq!(mutation.len(), 2, "BOTH reports survive — nothing is overwritten");
+		assert!(!mutation[0].passed, "the red is still on the board");
+		assert_eq!(mutation[0].note.as_deref(), Some("score=0.400"), "with its evidence");
+		assert!(mutation[1].passed, "followed by the green");
+		assert!(mutation[0].seq < mutation[1].seq, "in report order");
+		assert!(b.gate_satisfied("h1", GATE_MUTATION).unwrap(), "latest report wins: the gate is clear");
+		assert_eq!(b.red_gate_count("h1").unwrap(), 1, "and the red is COUNTED, not hidden");
+
+		// the other direction: a green that a later red supersedes does NOT hold
+		let b = mem();
+		b.create_ticket("h2", "build", "green then red", 2).unwrap();
+		clear_align(&b, "h2");
+		b.report_gate("h2", GATE_TESTS_GREEN, "bash", GateSource::Machine, true, Some("exit=0")).unwrap();
+		assert!(b.gate_satisfied("h2", GATE_TESTS_GREEN).unwrap());
+		b.report_gate("h2", GATE_TESTS_GREEN, "bash", GateSource::Machine, false, Some("exit=1")).unwrap();
+		assert_eq!(b.gate_reports("h2").unwrap().iter().filter(|r| r.gate == GATE_TESTS_GREEN).count(), 2);
+		assert!(
+			!b.gate_satisfied("h2", GATE_TESTS_GREEN).unwrap(),
+			"the stale pass does not outrank the failure that followed it"
+		);
+	}
+
+	// The provider hole, closed. `run_harden` reports `mutation_score` under the
+	// TOOL name when it measures something and under "none" when the diff has
+	// nothing to mutate — different providers, so under the old key they were two
+	// coexisting rows and "any passing row" read the vacuous pass as satisfaction
+	// with the red sitting right beside it. A red is now cleared only by a re-run
+	// of the provider that produced it.
+	#[test]
+	fn a_vacuous_pass_from_another_provider_does_not_clear_a_red() {
+		let b = mem();
+		b.create_ticket("p1", "build", "provider hole", 2).unwrap();
+		clear_align(&b, "p1");
+
+		b.report_gate("p1", GATE_MUTATION, "cargo-mutants", GateSource::Machine, false, Some("score=0.400"))
+			.unwrap();
+		b.report_gate("p1", GATE_MUTATION, "none", GateSource::Machine, true, Some("nothing to mutate"))
+			.unwrap();
+		assert!(
+			!b.gate_satisfied("p1", GATE_MUTATION).unwrap(),
+			"a pass from a DIFFERENT provider cannot clear another provider's failure"
+		);
+		// and the honest way out: re-run the provider that failed
+		b.report_gate("p1", GATE_MUTATION, "cargo-mutants", GateSource::Machine, true, Some("score=0.900"))
+			.unwrap();
+		assert!(b.gate_satisfied("p1", GATE_MUTATION).unwrap(), "the failing provider went green");
+		assert_eq!(b.gate_reports("p1").unwrap().iter().filter(|r| r.gate == GATE_MUTATION).count(), 3);
+	}
+
+	// created_at now means what it says. Under the upsert the row kept the FIRST
+	// report's timestamp beside the LAST report's verdict (observed live: a gate
+	// stamped 08-06 16:26 whose surviving verdict came from an 08-07 15:45 re-run).
+	// Backdating the first row makes the difference observable despite
+	// CURRENT_TIMESTAMP's one-second resolution.
+	#[test]
+	fn each_report_carries_its_own_timestamp() {
+		let b = mem();
+		b.create_ticket("ts", "build", "stamps", 2).unwrap();
+		clear_align(&b, "ts");
+		b.report_gate("ts", GATE_TESTS_GREEN, "bash", GateSource::Machine, false, Some("exit=1")).unwrap();
+		b.conn
+			.execute(
+				"UPDATE gate_results SET created_at = '2000-01-01 00:00:00' WHERE gate = ?1",
+				params![GATE_TESTS_GREEN],
+			)
+			.unwrap();
+
+		let now: String =
+			b.conn.query_row("SELECT CURRENT_TIMESTAMP", [], |r| r.get(0)).unwrap();
+		b.report_gate("ts", GATE_TESTS_GREEN, "bash", GateSource::Machine, true, Some("exit=0")).unwrap();
+
+		let rows: Vec<_> = b
+			.gate_reports("ts")
+			.unwrap()
+			.into_iter()
+			.filter(|r| r.gate == GATE_TESTS_GREEN)
+			.collect();
+		assert_eq!(rows.len(), 2);
+		assert_eq!(rows[0].created_at, "2000-01-01 00:00:00", "the first report keeps its stamp");
+		assert!(
+			rows[1].created_at >= now,
+			"the second report carries the SECOND report's time ({} < {now})",
+			rows[1].created_at,
+		);
+	}
+
+	// red_gate_count is the number the one-liners carry: reds at the CURRENT
+	// attempt only — a rework epoch already announces itself through `attempt`.
+	#[test]
+	fn red_gate_count_is_scoped_to_the_current_attempt() {
+		let b = mem();
+		b.create_ticket("rc", "build", "counts", 2).unwrap();
+		clear_align(&b, "rc");
+		assert_eq!(b.red_gate_count("rc").unwrap(), 0, "a clean ticket carries no red");
+
+		b.report_gate("rc", GATE_TESTS_GREEN, "bash", GateSource::Machine, false, None).unwrap();
+		b.report_gate("rc", GATE_MUTATION, "cargo-mutants", GateSource::Machine, false, None).unwrap();
+		assert_eq!(b.red_gate_count("rc").unwrap(), 2);
+
+		b.set_status("rc", Status::Rework).unwrap(); // attempt 0 -> 1
+		assert_eq!(b.red_gate_count("rc").unwrap(), 0, "a new epoch starts clean");
+		assert_eq!(b.gate_reports("rc").unwrap().len(), 3, "but the history is still all there");
 	}
 
 	// the `agent board` listing: every ticket, ordered spine-position → priority

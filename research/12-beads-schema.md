@@ -1,6 +1,6 @@
 # beads — Board Schema Extraction (DR2)
 
-> Source: `git clone --depth 1 https://github.com/steveyegge/beads` → `/Users/GaryT/Documents/Work/Skills/beads`.
+> Source: `git clone --depth 1 https://github.com/steveyegge/beads` → `$HOME/Documents/Work/Skills/beads`.
 > Read the actual schema (`internal/storage/schema/migrations/*.up.sql`, 50 migrations), the Go type model
 > (`internal/types/types.go`, `id_generator.go`), idgen (`internal/idgen/hash.go`), compaction
 > (`internal/storage/issueops/compaction.go`, `internal/compact/`), and the prime/remember commands
@@ -435,7 +435,7 @@ expected Rust-native verdict.
 
 ## Sources (paths read)
 
-- `/Users/GaryT/Documents/Work/Skills/beads/internal/storage/schema/schema.go` — migration engine, Dolt commit/stage machinery
+- `$HOME/Documents/Work/Skills/beads/internal/storage/schema/schema.go` — migration engine, Dolt commit/stage machinery
 - `…/internal/storage/schema/migrations/` — all 50 `*.up.sql`; read in full: `0001_create_issues`, `0002_create_dependencies`, `0008_create_child_counters`, `0009_create_issue_snapshots`, `0010_create_compaction_snapshots`, `0013_create_issue_counter`, `0017`/`0025`/`0044` (`ready_issues` view evolution), `0018` (`blocked_issues`), `0027_add_started_at`, `0041_split_dependencies_target`, `0046_add_is_blocked`, `0050_dependencies_deterministic_id`
 - `…/internal/types/types.go` — Issue/Dependency structs, Status + category model, IssueType, full DependencyType taxonomy + `AffectsReadyWork`/`IsBlockingEdge`/`IsWellKnown`/`IsFailureClose`
 - `…/internal/types/id_generator.go` + `…/internal/idgen/hash.go` — hash ID, base36, progressive collision, hierarchical child IDs, `MaxHierarchyDepth`

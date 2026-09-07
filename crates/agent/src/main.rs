@@ -18,11 +18,11 @@
 //!   agent verify <id>                                run validation → tests_green → review (or bounce); re-runs a review-band ticket
 //!   agent review <id> [--worker k]                   decorrelated DeepSeek acceptance review of a branch (advisory)
 //!   agent land <id>                                  squash-merge the worktree branch → main (human keystone) → done
-//!   agent show <id>                                  print the full §5 workpad (the rendered contract)
+//!   agent show <id> [--json]                         print the full §5 workpad (the rendered contract); --json emits the ticket object
 //!   agent trajectory <id>                            print the latest run's row + recorded trajectory
 //!   agent ready                                      list ready ticket ids
-//!   agent board                                      one line per ticket (whole board) + per-status counts
-//!   agent status <id>                                print status + attempt
+//!   agent board [--json]                             one line per ticket (whole board) + per-status counts; --json emits {states,counts,tickets}
+//!   agent status <id> [--json]                       print status + attempt; --json emits {id,status,attempt}
 //!   agent rework <id>                                send a ticket back (hard reset)
 //!   agent remember "<title>" [--type T --body B --salience S --scope SC ...]  capture a memory
 //!   agent recall "<query>" [--k N --project P --scope SC]                     lexical recall (index)
@@ -217,14 +217,32 @@ async fn main() -> Result<()> {
 			println!("{id}  → rework (attempt {}); worktree cleaned", board.get(&id)?.attempt);
 		}
 		"show" => {
-			let id = arg(&args, 2, "show <id>")?;
+			let id = positional(&args, 2, "show <id>")?;
 			let t = board.get(&id)?;
-			println!("{}", board::render(&t, &workpad_header(&id)));
+			if has_flag(&args, "--json") {
+				println!("{}", serde_json::to_string_pretty(&ticket_json(&board, &t)?)?);
+			} else {
+				// the human view carries the sixth section: every gate report ever
+				// recorded, reds included (the loop's pad stays the five-section §5 shape)
+				let reports = board.gate_reports(&id)?;
+				println!("{}", board::render_with_gates(&t, &workpad_header(&id), &reports));
+			}
 		}
 		"status" => {
-			let id = arg(&args, 2, "status <id>")?;
+			let id = positional(&args, 2, "status <id>")?;
 			let t = board.get(&id)?;
-			println!("{}  [{}] {}  attempt={}  \"{}\"", t.id, t.kind, t.status.as_str(), t.attempt, t.title);
+			if has_flag(&args, "--json") {
+				println!(
+					"{}",
+					serde_json::to_string_pretty(&json!({
+						"id": t.id,
+						"status": t.status.as_str(),
+						"attempt": t.attempt,
+					}))?
+				);
+			} else {
+				println!("{}", ticket_line(&board, &t));
+			}
 		}
 		"trajectory" => {
 			let id = arg(&args, 2, "trajectory <id> [--full]")?;
@@ -238,10 +256,14 @@ async fn main() -> Result<()> {
 		}
 		"board" => {
 			let tickets = board.all_tickets()?;
-			for t in &tickets {
-				println!("{}  [{}] {}  attempt={}  \"{}\"", t.id, t.kind, t.status.as_str(), t.attempt, t.title);
+			if has_flag(&args, "--json") {
+				println!("{}", serde_json::to_string_pretty(&board_json(&board, &tickets)?)?);
+			} else {
+				for t in &tickets {
+					println!("{}", ticket_line(&board, t));
+				}
+				println!("{}", board_summary(&tickets));
 			}
-			println!("{}", board_summary(&tickets));
 		}
 		"run" => {
 			let id = arg(&args, 2, "run <id> [--worker claude]")?;
@@ -2981,6 +3003,34 @@ fn next_id(board: &Board) -> Result<String> {
 /// The `agent board` summary line — per-status counts, e.g.
 /// `6 tickets: 3 done, 2 todo, 1 in_progress`. Biggest bucket first; a count tie
 /// breaks by spine position (todo before done), so the line reads stably.
+/// The per-ticket one-liner `agent status` and `agent board` print, with the
+/// red-gate count appended. The count is the ONLY place a failing gate shows up
+/// without knowing the history exists — `agent show` renders the reports
+/// themselves. A board read that can't count (a torn row, a missing ticket) must
+/// not take the listing down with it, so it degrades to no suffix.
+fn ticket_line(board: &Board, t: &Ticket) -> String {
+	let reds = board.red_gate_count(&t.id).unwrap_or(0);
+	format!(
+		"{}  [{}] {}  attempt={}  \"{}\"{}",
+		t.id,
+		t.kind,
+		t.status.as_str(),
+		t.attempt,
+		t.title,
+		red_gate_suffix(reds),
+	)
+}
+
+/// ` (N red gate[s])`, or nothing at all when the ticket is clean — a zero
+/// printed on every line is noise nobody reads.
+fn red_gate_suffix(reds: i64) -> String {
+	match reds {
+		n if n <= 0 => String::new(),
+		1 => "  (1 red gate)".to_string(),
+		n => format!("  ({n} red gates)"),
+	}
+}
+
 fn board_summary(tickets: &[Ticket]) -> String {
 	let mut counts: Vec<(Status, usize)> = Vec::new();
 	for t in tickets {
@@ -2997,6 +3047,114 @@ fn board_summary(tickets: &[Ticket]) -> String {
 	}
 	let parts: Vec<String> = counts.iter().map(|(s, n)| format!("{n} {}", s.as_str())).collect();
 	format!("{total} {noun}: {}", parts.join(", "))
+}
+
+// ---- machine-readable output (--json) -------------------------------------
+//
+// The same reads the text renderers use (`get` / `all_tickets` / `gate_reports`),
+// re-emitted as JSON so scripts consume the board without scraping prose. The
+// flag is a bare boolean accepted anywhere after the verb (`has_flag` scans all
+// of argv; `positional` skips flag tokens to find the id). Text output with the
+// flag absent is byte-identical to before — existing scripts parse it.
+
+/// The spine states in `Status` declaration order — the fixed order board JSON
+/// speaks. Deliberately NOT `spine_pos` order (which slots `rework` before
+/// terminal `done` for presentation); spellings come from `as_str`, the single
+/// source of the wire names.
+const SPINE_ORDER: [Status; 8] = [
+	Status::Todo,
+	Status::Align,
+	Status::InProgress,
+	Status::Verify,
+	Status::Review,
+	Status::Land,
+	Status::Done,
+	Status::Rework,
+];
+
+/// The first positional argument at-or-after `start`, skipping `--`-prefixed
+/// flag tokens so `agent show --json t1` and `agent show t1 --json` are the
+/// same call. Same failure shape as `arg` (bail with the usage string).
+fn positional(args: &[String], start: usize, usage: &str) -> Result<String> {
+	args.iter()
+		.skip(start)
+		.find(|a| !a.starts_with("--"))
+		.filter(|s| !s.trim().is_empty())
+		.cloned()
+		.ok_or_else(|| anyhow::anyhow!("usage: agent {usage}"))
+}
+
+/// One ticket as a JSON object: the identifying row, the §5 workpad, the full
+/// append-only gate history, and the red-gate count. Fields the read shape
+/// doesn't carry are null, never invented: `created_at`/`updated_at` live in
+/// the `ticket` table but are not selected by the queries the text renderers
+/// use (`Ticket` has no such fields), so they emit null here.
+fn ticket_json(board: &Board, t: &Ticket) -> Result<Value> {
+	let reports = board.gate_reports(&t.id)?;
+	// red_gates counts GATES, not reports (unlike `red_gate_count`, which counts
+	// every failing report): latest row per gate name — reports arrive seq-
+	// ascending, so the last write per name wins — red iff that row failed.
+	let mut latest: std::collections::BTreeMap<&str, &board::GateReport> = std::collections::BTreeMap::new();
+	for r in &reports {
+		latest.insert(r.gate.as_str(), r);
+	}
+	let red_gates = latest.values().filter(|r| !r.passed).count();
+	// Confusions keep overwrite semantics by design (one current confusion, not
+	// a history), so the list is empty or a single entry.
+	let confusions = match t.confusions.as_deref().map(str::trim) {
+		Some(s) if !s.is_empty() => json!([s]),
+		_ => json!([]),
+	};
+	Ok(json!({
+		"id": t.id,
+		"kind": t.kind,
+		"status": t.status.as_str(),
+		"attempt": t.attempt,
+		"title": t.title,
+		"priority": t.priority,
+		"created_at": Value::Null,
+		"updated_at": Value::Null,
+		"workpad": {
+			"plan": t.plan,
+			"criteria": t.acceptance_criteria,
+			"validation": t.validation,
+			"notes": t.notes,
+			"confusions": confusions,
+		},
+		"gates": reports
+			.iter()
+			.map(|r| {
+				json!({
+					"id": r.seq,
+					"gate": r.gate,
+					"passed": r.passed,
+					"provider": r.provider,
+					"source": r.source.as_str(),
+					"attempt": r.attempt,
+					"note": r.note,
+					"created_at": r.created_at,
+				})
+			})
+			.collect::<Vec<Value>>(),
+		"red_gates": red_gates,
+	}))
+}
+
+/// The whole board as one JSON object: every spine state in order, zero-filled
+/// per-status counts, and every ticket via `ticket_json` (in `all_tickets`
+/// order: spine position, then priority, then id).
+fn board_json(board: &Board, tickets: &[Ticket]) -> Result<Value> {
+	let mut counts = serde_json::Map::new();
+	for s in SPINE_ORDER {
+		let n = tickets.iter().filter(|t| t.status == s).count();
+		counts.insert(s.as_str().to_string(), json!(n));
+	}
+	let tickets_json = tickets.iter().map(|t| ticket_json(board, t)).collect::<Result<Vec<Value>>>()?;
+	Ok(json!({
+		"states": SPINE_ORDER.iter().map(|s| json!(s.as_str())).collect::<Vec<Value>>(),
+		"counts": counts,
+		"tickets": tickets_json,
+	}))
 }
 
 #[cfg(test)]
@@ -3045,6 +3203,36 @@ mod tests {
 
 	// the `agent board` summary line: counts group by status, biggest bucket first,
 	// count ties break by spine position, and the ticket/tickets noun agrees.
+	// AC6's surface: the operator must SEE a red without knowing the Gates section
+	// exists. `agent show` renders every report (reds included, in seq order); the
+	// `agent status` / `agent board` one-liner carries the count.
+	#[test]
+	fn red_gates_are_visible_on_show_and_in_the_one_liner() {
+		let b = Board::open(":memory:").unwrap();
+		to_in_progress(&b, "rg", "true");
+		assert_eq!(ticket_line(&b, &b.get("rg").unwrap()).find("red gate"), None, "clean: no suffix");
+
+		// a red harden run, then the green re-run that fixed it
+		b.report_gate("rg", board::GATE_MUTATION, "cargo-mutants", GateSource::Machine, false, Some("score=0.400"))
+			.unwrap();
+		b.report_gate("rg", board::GATE_MUTATION, "cargo-mutants", GateSource::Machine, true, Some("score=0.812"))
+			.unwrap();
+
+		let line = ticket_line(&b, &b.get("rg").unwrap());
+		assert!(line.contains("(1 red gate)"), "the fixed red is still counted: {line}");
+		assert!(line.contains("rg  [build] in_progress  attempt=0"), "the one-liner is unchanged otherwise");
+
+		let pad = board::render_with_gates(&b.get("rg").unwrap(), "h", &b.gate_reports("rg").unwrap());
+		let red = pad.find("mutation_score  FAIL").expect("the red report is rendered");
+		let green = pad.find("mutation_score  PASS").expect("so is the green re-run");
+		assert!(red < green, "in report order");
+		assert!(pad.contains("score=0.400"), "with the evidence note that justified the refusal");
+
+		// plural/zero forms
+		assert_eq!(red_gate_suffix(0), "");
+		assert_eq!(red_gate_suffix(3), "  (3 red gates)");
+	}
+
 	#[test]
 	fn board_summary_counts_per_status() {
 		let mk = |id: &str, status: Status| Ticket {

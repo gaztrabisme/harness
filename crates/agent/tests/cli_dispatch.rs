@@ -102,3 +102,89 @@ fn sprint_verb_reaches_its_dispatch_arm_not_usage() {
 	assert!(!stderr.contains(USAGE_SNIPPET), "sprint must not hit the usage path, got: {stderr}");
 	assert!(db.exists(), "sprint opens the board at HARNESS_DB");
 }
+
+// The --json machine-readable face of the read verbs (board/show/status): the
+// same reads the text renderers use, emitted as one JSON object per invocation,
+// with the flag accepted anywhere after the verb. Drives a real board through
+// new → criteria → align (the path `dogfood/board-json-check.sh` walks in
+// bash+python) and pins the contract — including that the TEXT line is
+// byte-for-byte unchanged when the flag is absent (existing scripts parse it).
+#[test]
+fn json_flags_on_board_show_status_emit_the_machine_contract() {
+	use serde_json::Value;
+
+	let dir = fresh_dir("json-verbs");
+	let db = dir.join("board.db");
+	let run = |args: &[&str]| {
+		let out = run_agent(&dir, args, Some(&db));
+		assert!(
+			out.status.success(),
+			"`agent {}` must succeed, stderr: {}",
+			args.join(" "),
+			String::from_utf8_lossy(&out.stderr)
+		);
+		String::from_utf8_lossy(&out.stdout).into_owned()
+	};
+
+	let new_out = run(&["new", "json check", "--kind", "question"]);
+	let id = new_out.split_whitespace().next().expect("new prints the minted id").to_string();
+
+	run(&["criteria", &id, "states/counts/tickets round-trip as JSON"]);
+	run(&["validation", &id, "true"]);
+	run(&["note", &id, "seeded by the json test"]);
+	run(&["align", &id]);
+
+	// board --json: the 8 spine states in declaration order, zero-filled counts,
+	// exactly one ticket — in_progress past the human align gate.
+	let board: Value = serde_json::from_str(&run(&["board", "--json"])).expect("board --json is one JSON object");
+	assert_eq!(board["states"].as_array().map(|a| a.len()), Some(8), "states: {}", board["states"]);
+	assert_eq!(board["states"][0].as_str(), Some("todo"));
+	let tickets = board["tickets"].as_array().expect("tickets is a list");
+	assert_eq!(tickets.len(), 1, "one ticket on the fresh board");
+	assert_eq!(tickets[0]["status"].as_str(), Some("in_progress"));
+	assert_eq!(tickets[0]["kind"].as_str(), Some("question"));
+	assert_eq!(tickets[0]["attempt"].as_i64(), Some(0));
+	assert_eq!(
+		tickets[0]["workpad"]["criteria"].as_str(),
+		Some("states/counts/tickets round-trip as JSON"),
+		"workpad.criteria is the text that was set"
+	);
+	assert!(tickets[0]["gates"].is_array(), "gates is a list");
+	assert_eq!(tickets[0]["red_gates"].as_i64(), Some(0));
+	// never invent what the read shape doesn't carry:
+	assert!(tickets[0]["created_at"].is_null(), "unstamped created_at stays null");
+	assert!(tickets[0]["updated_at"].is_null(), "unstamped updated_at stays null");
+
+	// show <id> --json: the same ticket-object shape, standalone. The align pass
+	// is one row of the gate history (a list), red_gates counts latest-per-gate.
+	let show: Value = serde_json::from_str(&run(&["show", &id, "--json"])).expect("show --json is one JSON object");
+	assert_eq!(show["id"].as_str(), Some(id.as_str()));
+	assert_eq!(show["status"].as_str(), Some("in_progress"));
+	assert_eq!(show["workpad"]["criteria"].as_str(), Some("states/counts/tickets round-trip as JSON"));
+	assert!(show["gates"].is_array(), "gates is a list");
+	assert_eq!(show["gates"].as_array().map(|a| a.len()), Some(1), "the human align pass is in the history");
+	assert_eq!(show["gates"][0]["passed"].as_bool(), Some(true));
+	assert_eq!(show["red_gates"].as_i64(), Some(0));
+
+	// status <id> --json: exactly the three keys, in a single object. (Key ORDER
+	// is not part of the contract — serde_json's map sorts keys alphabetically.)
+	let status: Value = serde_json::from_str(&run(&["status", &id, "--json"])).expect("status --json is one JSON object");
+	let mut keys: Vec<&str> =
+		status.as_object().expect("status is an object").keys().map(String::as_str).collect();
+	keys.sort_unstable();
+	assert_eq!(keys, vec!["attempt", "id", "status"], "exactly the three keys");
+	assert_eq!(status["status"].as_str(), Some("in_progress"));
+
+	// the flag is accepted anywhere after the verb — before the id too.
+	let flipped: Value =
+		serde_json::from_str(&run(&["status", "--json", &id])).expect("--json before the id still parses");
+	assert_eq!(flipped["status"].as_str(), Some("in_progress"));
+
+	// with the flag absent, the text line is byte-for-byte what it always was.
+	let text = run(&["status", &id]);
+	assert_eq!(
+		text,
+		format!("{id}  [question] in_progress  attempt=0  \"json check\"\n"),
+		"text output must stay byte-identical when --json is absent"
+	);
+}

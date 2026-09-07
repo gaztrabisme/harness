@@ -13,3 +13,12 @@ providers.toml
 # Python bytecode (dogfood katas + any agent-produced churn)
 __pycache__/
 *.pyc
+
+# Local databases and machine-local state (never publish)
+target/
+harness-board.db
+harness-board.db-shm
+harness-board.db-wal
+*.db-shm
+*.db-wal
+.nodeterm/

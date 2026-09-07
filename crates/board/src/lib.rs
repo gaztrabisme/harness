@@ -21,14 +21,16 @@ mod workpad;
 
 pub use board::Board;
 pub use memory::{NewMemory, clamp_primed_body};
-pub use model::{GateSource, MemoryHit, PrimedHit, Run, Scope, Status, Ticket, edge_kind_blocks};
+pub use model::{
+	GateReport, GateSource, MemoryHit, PrimedHit, Run, Scope, Status, Ticket, edge_kind_blocks,
+};
 pub use spine::{
 	GATE_CRITERIA_CONFIRMED, GATE_LANDED, GATE_MUTATION, GATE_ORACLE_INTACT, GATE_RESOLVED,
 	GATE_TESTS_GREEN, gate_source_required, is_operator_checker, is_protected_oracle, kind_is_code,
 	required_gates_for,
 	validate_transition,
 };
-pub use workpad::render;
+pub use workpad::{render, render_with_gates};
 
 #[cfg(test)]
 mod tests {
@@ -370,6 +372,151 @@ mod tests {
 		assert!(b.finish_run("ghost", "completed", 1).is_err());
 	}
 
+	/// The gate reports recorded on a real board, in the order they were reported.
+	///
+	/// PROVENANCE, stated plainly: this is a RECONSTRUCTION, not a byte-copy. The
+	/// board it describes (a cv-mapper project board) lives outside this worktree
+	/// and this ticket may not read it, so the sequence is rebuilt from the counts
+	/// measured off it and recorded in the ticket plan: 15 gate reports, 10
+	/// surviving `gate_results` rows, `t1`/`oracle_intact` reported three times,
+	/// `t1`/`mutation_score` twice, and ZERO surviving failures. The shape — which
+	/// keys repeat, and how often — is the part under test; the exact wording of
+	/// the notes is not.
+	const RECORDED_GATE_REPORTS: &[(&str, &str, &str, GateSource, bool)] = &[
+		// t1 — a build ticket that bounced three times off the oracle guard and
+		// twice off the mutation threshold before it landed.
+		("t1", GATE_CRITERIA_CONFIRMED, "gary", GateSource::Human, true),
+		("t1", GATE_MUTATION, "cargo-mutants", GateSource::Machine, false),
+		("t1", GATE_ORACLE_INTACT, "git", GateSource::Machine, false),
+		("t1", GATE_ORACLE_INTACT, "git", GateSource::Machine, false),
+		("t1", GATE_ORACLE_INTACT, "git", GateSource::Machine, true),
+		("t1", GATE_MUTATION, "cargo-mutants", GateSource::Machine, true),
+		("t1", GATE_TESTS_GREEN, "bash", GateSource::Machine, false),
+		("t1", GATE_TESTS_GREEN, "bash", GateSource::Machine, true),
+		("t1", GATE_LANDED, "gary", GateSource::Human, true),
+		// t2 — one verify bounce, otherwise clean.
+		("t2", GATE_CRITERIA_CONFIRMED, "gary", GateSource::Human, true),
+		("t2", GATE_MUTATION, "cargo-mutants", GateSource::Machine, true),
+		("t2", GATE_ORACLE_INTACT, "git", GateSource::Machine, true),
+		("t2", GATE_TESTS_GREEN, "bash", GateSource::Machine, false),
+		("t2", GATE_TESTS_GREEN, "bash", GateSource::Machine, true),
+		("t2", GATE_LANDED, "gary", GateSource::Human, true),
+	];
+
+	// Replay a recorded board's gate reports through the store. The old key kept
+	// one row per (issue, gate, provider, attempt), so this 15-report sequence
+	// collapsed to 10 rows with EVERY failure erased by the re-run that fixed it —
+	// which is exactly what the live boards look like: 112 reports, zero surviving
+	// `passed = 0`. Append-only keeps all 15, failures included.
+	#[test]
+	fn replaying_a_recorded_board_keeps_every_report_including_the_failures() {
+		let b = mem();
+		for id in ["t1", "t2"] {
+			b.create_ticket(id, "build", "recorded", 2).unwrap();
+		}
+		for (id, gate, provider, source, passed) in RECORDED_GATE_REPORTS {
+			b.report_gate(id, gate, provider, *source, *passed, None).unwrap();
+		}
+
+		let all: Vec<_> =
+			["t1", "t2"].iter().flat_map(|id| b.gate_reports(id).unwrap()).collect();
+		assert_eq!(all.len(), RECORDED_GATE_REPORTS.len(), "every report is a row: 15 in, 15 stored");
+
+		// what the OLD key would have kept: one row per (gate, provider, attempt)
+		// per ticket. 10 — the count actually observed on that board.
+		let mut keys: Vec<String> = RECORDED_GATE_REPORTS
+			.iter()
+			.map(|(id, gate, provider, _, _)| format!("{id}/{gate}/{provider}/0"))
+			.collect();
+		keys.sort();
+		keys.dedup();
+		assert_eq!(keys.len(), 10, "the old key would have collapsed these 15 reports to 10 rows");
+
+		let failures: Vec<_> = all.iter().filter(|r| !r.passed).collect();
+		assert!(!failures.is_empty(), "failures survive (the old store had ZERO across 112 reports)");
+		assert_eq!(
+			failures.iter().filter(|r| r.gate == GATE_ORACLE_INTACT).count(),
+			2,
+			"both t1 oracle_intact refusals are on the board",
+		);
+		// report order is preserved, and the reds sit before the green that fixed them
+		let t1 = b.gate_reports("t1").unwrap();
+		assert!(t1.windows(2).all(|w| w[0].seq < w[1].seq), "seq order is report order");
+		let oracle: Vec<bool> =
+			t1.iter().filter(|r| r.gate == GATE_ORACLE_INTACT).map(|r| r.passed).collect();
+		assert_eq!(oracle, vec![false, false, true], "the three oracle reports, in order");
+		// and the gate itself still reads clear — history costs nothing at the gate
+		assert!(b.gate_satisfied("t1", GATE_ORACLE_INTACT).unwrap());
+	}
+
+	// Migration v3 on a POPULATED v2 board: the old table is rebuilt around the
+	// new key, and every banked row comes across with its `created_at` intact
+	// (including two rows that differ only by provider — the shape the old key
+	// allowed). Fabricates the real v2 table, since that is what boards on disk
+	// have.
+	#[test]
+	fn migration_v3_rebuilds_a_populated_v2_gate_table() {
+		let path = std::env::temp_dir().join("harness-board-migrate-v3-test.db");
+		let clean = || {
+			let _ = std::fs::remove_file(&path);
+			let _ = std::fs::remove_file(path.with_extension("db-wal"));
+			let _ = std::fs::remove_file(path.with_extension("db-shm"));
+		};
+		clean();
+		let p = path.to_str().unwrap();
+
+		{
+			let b = Board::open(p).unwrap();
+			b.create_ticket("v1", "build", "banked", 2).unwrap();
+		}
+		// fabricate the v2 board: the pre-v3 gate table, three banked rows with
+		// known timestamps, user_version knocked back to 2.
+		{
+			let c = rusqlite::Connection::open(&path).unwrap();
+			c.execute_batch(
+				"DROP TABLE gate_results;
+				 CREATE TABLE gate_results (
+				     issue_id  TEXT NOT NULL,
+				     gate      TEXT NOT NULL,
+				     provider  TEXT NOT NULL,
+				     source    TEXT NOT NULL CHECK (source IN ('human','machine')),
+				     attempt   INTEGER NOT NULL,
+				     passed    INTEGER NOT NULL CHECK (passed IN (0, 1)),
+				     note      TEXT,
+				     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				     PRIMARY KEY (issue_id, gate, provider, attempt)
+				 );
+				 INSERT INTO gate_results VALUES
+				   ('v1','criteria_confirmed','gary','human',0,1,'aligned','2026-08-06 16:26:42'),
+				   ('v1','mutation_score','cargo-mutants','machine',0,1,'score=0.812','2026-08-07 15:45:43'),
+				   ('v1','mutation_score','none','machine',0,1,'nothing to mutate','2026-08-07 15:46:01');
+				 PRAGMA user_version=2;",
+			)
+			.unwrap();
+		}
+		// reopen → v3 rebuilds the table under the new key
+		{
+			let b = Board::open(p).unwrap();
+			let rows = b.gate_reports("v1").unwrap();
+			assert_eq!(rows.len(), 3, "every banked row survived the rebuild");
+			assert_eq!(rows[0].gate, "criteria_confirmed", "in their original order");
+			assert_eq!(rows[0].created_at, "2026-08-06 16:26:42", "with their original stamps");
+			assert_eq!(rows[1].created_at, "2026-08-07 15:45:43");
+			assert_eq!(rows[2].provider, "none", "including the two rows that differ only by provider");
+			assert!(rows[0].seq < rows[1].seq && rows[1].seq < rows[2].seq, "seq follows the copy order");
+
+			// and the rebuilt table is append-only: the key that used to overwrite now appends
+			b.report_gate("v1", GATE_MUTATION, "cargo-mutants", GateSource::Machine, false, Some("regressed"))
+				.unwrap();
+			assert_eq!(b.gate_reports("v1").unwrap().len(), 4);
+
+			let c = rusqlite::Connection::open(&path).unwrap();
+			let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+			assert_eq!(v, 3, "board is at v3");
+		}
+		clean();
+	}
+
 	// Unit A — the user_version migrator (research/17 §8 M1) actually upgrades a
 	// PRE-EXISTING v0 database: drop the run table + reset the version to simulate
 	// a board created before the migration, reopen, and confirm the migrator
@@ -388,6 +535,10 @@ mod tests {
 			b.create_ticket("m1", "build", "t", 2).unwrap();
 			b.start_run("m1-000-1", "m1", 0, "x", "oMLX", None, None).unwrap();
 			assert_eq!(b.runs_for("m1").unwrap().len(), 1);
+			// bank a gate verdict too: the v3 rebuild must carry banked history
+			// across, not just re-create an empty table.
+			b.report_gate("m1", GATE_TESTS_GREEN, "bash", GateSource::Machine, false, Some("exit=1"))
+				.unwrap();
 		}
 		// fabricate a v0 db: drop the run table, knock user_version back to 0
 		{
@@ -402,9 +553,15 @@ mod tests {
 			let b = Board::open(p).unwrap();
 			b.start_run("m1-000-2", "m1", 0, "x", "oMLX", None, None).unwrap();
 			assert_eq!(b.runs_for("m1").unwrap().len(), 1, "migrator re-created the run table");
+			// the banked gate report came through the v3 table rebuild intact
+			let reports = b.gate_reports("m1").unwrap();
+			assert_eq!(reports.len(), 1, "the pre-existing gate row survived the rebuild");
+			assert_eq!(reports[0].gate, GATE_TESTS_GREEN);
+			assert!(!reports[0].passed, "and kept its verdict");
+			assert_eq!(reports[0].note.as_deref(), Some("exit=1"), "and its evidence note");
 			let c = rusqlite::Connection::open(&path).unwrap();
 			let v: i64 = c.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-			assert_eq!(v, 2, "migrator advanced user_version 0 -> latest (v2)");
+			assert_eq!(v, 3, "migrator advanced user_version 0 -> latest (v3)");
 		}
 
 		let _ = std::fs::remove_file(&path);

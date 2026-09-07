@@ -1,7 +1,7 @@
 # beads_rust (br) Teardown — Board Substrate Decision (DR2-prime)
 
 > Source: `git clone --depth 1 https://github.com/Dicklesworthstone/beads_rust`
-> → `/Users/GaryT/Documents/Work/Skills/beads_rust`. Read the actual Rust source (storage schema, model,
+> → `$HOME/Documents/Work/Skills/beads_rust`. Read the actual Rust source (storage schema, model,
 > close_policy, coordination, mcp, lib layout, LICENSE), not just the README. `br` is **Jeffrey Emanuel's**
 > independent Rust reimplementation of Steve Yegge's beads — agent-first issue tracker, **SQLite + JSONL,
 > no Dolt**, ~180k LoC, edition 2024, nightly-pinned, MIT-with-rider. Version 0.2.15.
@@ -297,7 +297,7 @@ de-risks the keystone WORK-plane feature.
 
 ## Sources (paths read)
 
-- `/Users/GaryT/Documents/Work/Skills/beads_rust/Cargo.toml` — fsqlite×15 + fastmcp/self_update features, edition 2024, lints
+- `$HOME/Documents/Work/Skills/beads_rust/Cargo.toml` — fsqlite×15 + fastmcp/self_update features, edition 2024, lints
 - `…/rust-toolchain.toml` — pinned `nightly-2026-02-19`
 - `…/LICENSE` — MIT + OpenAI/Anthropic Rider (full read)
 - `…/src/lib.rs`, `…/src/storage/mod.rs` — crate is lib+bin; `SqliteStorage` concrete struct (no trait)

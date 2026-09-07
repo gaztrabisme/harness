@@ -153,7 +153,7 @@
 - **Evidence:** 21 unit tests (9 board + 12 agent — board: render order/header/3-placeholders, notes+confusions
   persist+audit; agent: confusion bounce flips the tool gate + todo-just-records, system_prompt embeds the render),
   `cargo test --workspace` green, clippy clean, **live `agent show`** (full §5 render, header
-  `McBob.local:…@ecd7bdc`) + **confusion bounce** (in_progress→align, show reflects both).
+  `<host>:…@ecd7bdc`) + **confusion bounce** (in_progress→align, show reflects both).
 - **THE TRUNK IS COMPLETE (s1–s5).** **Not committed yet** (Gary's call). **Next: the pillars** — memory plane
   (sidecar + wiki retrieval on oMLX), the §7 Harden/mutation gate, parallel exploration (coordinator + claim/lease
   FSM), self-evolution — per design-v2 §12.
@@ -203,7 +203,7 @@
 - **Evidence:** 3 new regression tests (confine allows-in/rejects-escape; write_file refuses absolute + `../` and
   **leaves nothing outside the worktree**; read_file refuses an absolute read of a real outside file) → 13 agent
   tests; `cargo test --workspace` green (1 ignored = live oMLX); clippy clean. Live: `agent show` header is now
-  `McBob.local:harness@<sha>` with no `/Users/...` leak.
+  `<host>:harness@<sha>` with no home-absolute-path leak.
 - **Next:** Unit B (Recorder + loop wiring + lenient reader; t2 spec'd) — agent exercises are safe to resume.
 
 ## [2026-06-09] session | Telemetry Unit B built (prod) — trajectory recorder + run wiring + `truncated` taxonomy
@@ -798,7 +798,7 @@ project". Commits 083cd85 → 5a27745 (12); suite 167 → 199 tests, clippy clea
 - **Strategic posture settled (decisions.md): contain Claude Code, don't compete.** Thesis: prompting is advisory,
   code is enforced. Tripwire: CC-like UX before the coordinator = drift. MCP-wrapper idea recorded (unscheduled;
   keystones never on the MCP surface; needs a name — Warden/Keel/Spine floated).
-- **REAL dogfood: PDSI-from-docs** (`~/Documents/Work/client/Accelerator/harness-run/`, board `../harness-board.db`).
+- **REAL dogfood: PDSI-from-docs** (`~/Documents/Work/FPT/Accelerator/harness-run/`, board `../harness-board.db`).
   Re-derived the Accelerator's pipeline on the real client doc package via the harness spine: t1 ingest (60k-word
   context pack) → t2 SRS (39 REQ-IDs, 39/39 verbatim-traced, 0 unmatched) → t3 architecture (6-service
   services.yaml) → t4 scaffold (kit golden templates via instantiate.py; landed on attempt 2). Hand-authored
@@ -823,7 +823,7 @@ project". Commits 083cd85 → 5a27745 (12); suite 167 → 199 tests, clippy clea
 
 **PDSI t5 (vertical slice) — landed 813373a; the real dogfood is 5/5 COMPLETE.**
 - Gary resolved the fork: real ONNX, found locally by an Explore subagent —
-  `client/pdsi/pdsi-services/pdsi-inference-service/models/fused_nano_multilabel.onnx` (43MB, production version
+  `FPT/pdsi/pdsi-services/pdsi-inference-service/models/fused_nano_multilabel.onnx` (43MB, production version
   y26n-rigft-rig12glv-2026-07-13) with its load-bearing `thresholds.json` beside it (input 1280, conf/iou 0.45,
   letterbox+RGB+/255, per_task_thresh {}).
 - **Operator pre-work made the ticket honest** (the reusable pattern): (1) probed the model with onnxruntime —
@@ -1002,3 +1002,29 @@ resurface) and the real-CCTV e2e addendum is dropped. Full decision records in d
 non-Gary items: next-window ledger instrument (estimate column + comparator arm), stream-event cost
 accumulation (telemetry gap fix), Omnigent teardown → research/17 (its trigger — the reviewer DELETE —
 has fired), cross-vendor reviewer design gated on that teardown.
+
+## 2026-08-03 — Operator skill drafted + GitHub publish prep (fresh snapshot staged)
+
+**Operator front-end resolved as a skill** (breadcrumb in active-work.md): `~/.claude/skills/harness-operator/`
+(personal, carries machine paths) + `skills/harness-operator/SKILL.md` (portable copy, tracked in-repo).
+MCP wrapper and ratatui TUI both REJECTED — keystones stay off programmatic surfaces; CC is the interface.
+
+**Publish prep (Gary: fresh snapshot, scrub FPT, keep PDSI codename):**
+- Key hygiene `db1b100`: DeepSeek baked key REMOVED (env-only `DEEPSEEK_API_KEY`, bail with guidance —
+  its own comment carried the trigger "ROTATE if this repo ever goes public"); oMLX key now resolved at
+  runtime (`OMLX_API_KEY` → `~/.omlx/settings.json auth.api_key` → empty) via `provider::omlx_key()`;
+  recorder redacts the *resolved* value, empty-secret guarded (`str::replace("")` garbles). 247 tests +
+  clippy green; release binary rebuilt. NOTE: `agent review` now needs the env var exported.
+- `c0e14ce`: LICENSE (MIT, gaztrabisme + pi-iso third-party note — pi-iso NOTICE already carried the
+  upstream MIT text since lift), README rewritten (June "Phase 0 spike" text was stale → graduated
+  daily-driver story), portable skill. `41df8b1`: test-key must not embed real key digits (audit catch).
+- **Snapshot** `~/Documents/Work/harness-public/` — `git archive HEAD`, FPT/ → client/ in 3 wiki files,
+  fresh git, single commit `d3f46f9` (115 files). Audit clean: no keys, no FPT, no key-shaped strings.
+  Living repo keeps full history (which contains the dead DeepSeek key + FPT paths — that is WHY the
+  public repo is a fresh snapshot, not a mirror). NOT PUSHED — staged for Gary's review.
+
+## 2026-08-03 — PUBLISHED: github.com/gaztrabisme/harness (public)
+
+Snapshot `d3f46f9` pushed as `main` (Gary's go after review). Skill ships in-repo at
+`skills/harness-operator/`. Living repo stays private/local; future publishes = re-snapshot
+(archive → scrub → new commit on the public repo), not a mirror.

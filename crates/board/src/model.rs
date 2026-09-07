@@ -87,6 +87,39 @@ impl GateSource {
 	}
 }
 
+impl std::str::FromStr for GateSource {
+	type Err = ();
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		Ok(match s {
+			"human" => Self::Human,
+			"machine" => Self::Machine,
+			_ => return Err(()),
+		})
+	}
+}
+
+/// One recorded gate verdict — a row of the append-only `gate_results` store
+/// (schema v3). The store keeps EVERY report, so a red that a later green
+/// superseded is still here: `seq` (autoincrement, i.e. commit order) is the
+/// only correct sort, since `created_at` is second-resolution and same-second
+/// reports are routine. `gate_satisfied` decides which of these rows is in
+/// force; this shape is the history behind that decision.
+#[derive(Debug, Clone)]
+pub struct GateReport {
+	/// Autoincrement primary key — report order, and the sort key for every reader.
+	pub seq: i64,
+	pub gate: String,
+	pub provider: String,
+	pub source: GateSource,
+	/// The rework epoch the verdict was recorded at.
+	pub attempt: i64,
+	pub passed: bool,
+	pub note: Option<String>,
+	/// When THIS report was written (under the old upsert this carried the first
+	/// report's timestamp beside the last report's verdict).
+	pub created_at: String,
+}
+
 /// A ticket row (the read shape). Workpad fields are nullable — they fill in
 /// across the lifecycle (the workpad-rendering slice owns their editing).
 #[derive(Debug, Clone)]

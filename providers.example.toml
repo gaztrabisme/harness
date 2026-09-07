@@ -21,7 +21,7 @@
 
 # A second oMLX-compatible endpoint (e.g. a remote box running the same server).
 [omlx-remote]
-base_url = "http://100.106.185.34:8000/v1"
+base_url = "http://<bppc-host>:8000/v1"
 key_env = "OMLX_REMOTE_KEY"
 model = "Qwen3.6-35B-A3B-oQ8-fp16-mtp"
 dialect = "omlx"

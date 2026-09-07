@@ -54,7 +54,17 @@ content, don't fork it.
 
 ## Current focus
 
-→ `wiki/active-work.md` — trunk + pillars DONE; the readiness assessment's **critical path is COMPLETE**
-(2026-07-14): `agent draft` (intake) → `agent run --worker claude` (delegated CC worker) → `agent sprint`/`edge`
-(coordinator). Posture: **contain Claude Code, don't compete** (decisions.md 2026-07-14). Next gate for the
-daily-driver claim: dogfood a **real (non-kata) multi-ticket project** end-to-end.
+→ `wiki/active-work.md` — trunk + pillars + critical path DONE. **The daily-driver claim GRADUATED
+(A6, Gary, 2026-08-02)** on the closed 5/5 trial window: new multi-ticket project work defaults to the
+spine (board + gates + delegated worker); ad-hoc stays interactive CC **by posture, not shortfall**.
+Posture unchanged: **contain Claude Code, don't compete** (decisions.md 2026-07-14).
+
+**Current run — trial window 2** (`wiki/cv-mapper-trial.md` → the plan): the cv-mapper trial evidenced
+that the gates **hold on outcome and fail on record** (no red gate survives `report_gate`'s upsert), the
+loop **holds for the delegated arm and fails for the native arm**, and the operator tax is **not
+established** because A6's two owed instruments were never built. This run fixes both and pays both —
+the upfront-estimate column and the comparator arm land before any new measured claim
+(`trial-ledger.md:92-94`).
+
+> Anything naming a "next gate" for the daily-driver claim is a pre-08-02 breadcrumb, not a live gate.
+> Check `decisions.md` "A6" before treating one as open.
