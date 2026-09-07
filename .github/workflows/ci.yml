@@ -16,7 +16,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked -q
+      - if: runner.os != 'Windows'
+        run: cargo test --locked -q
+      # Windows: the board crate and the verbs the pi extension calls. The
+      # full agent suite drives git worktrees and unix paths (open item).
+      - if: runner.os == 'Windows'
+        run: cargo test --locked -q -p board && cargo test --locked -q -p agent --test board_extension --test cli_dispatch && cargo build --locked -q -p agent
 
   clippy:
     runs-on: ubuntu-22.04
