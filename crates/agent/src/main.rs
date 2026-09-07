@@ -2,6 +2,7 @@
 //! gated by a *board ticket's* spine status (the standalone Phase-0 toggle is
 //! retired). Every run is ticket-scoped; the board is the single source of truth
 //! for "can this tool run". CLI:
+//!   agent --db <path> <verb> ...                     global: board db for this run (beats HARNESS_DB)
 //!   agent new "<title>" [--kind K] [--priority N]   create a ticket (todo)
 //!   agent draft <id> [--force]                       strong provider drafts Plan/Criteria/Validation (pre-Align proposal)
 //!   agent plan <id> "<text>"                         set the workpad plan
@@ -146,18 +147,49 @@ fn known_verb(cmd: &str) -> bool {
 	KNOWN_VERBS.contains(&cmd)
 }
 
+/// Resolve the board database path for one invocation: the `--db` flag wins over
+/// the `HARNESS_DB` env var, which wins over the repo-default `harness-board.db`.
+/// One resolver so the three sources can't drift apart across the verbs that open
+/// the board; pure on its arguments (no process-env reads) so it is unit-testable.
+fn db_path(cli_flag: Option<&str>, env: Option<&str>) -> String {
+	cli_flag
+		.map(ToOwned::to_owned)
+		.or_else(|| env.map(ToOwned::to_owned))
+		.unwrap_or_else(|| "harness-board.db".into())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-	let args: Vec<String> = std::env::args().collect();
+	let raw_args: Vec<String> = std::env::args().collect();
+	// `--db <path>` is a global flag, legal before or after the verb. Strip every
+	// occurrence (last one wins) BEFORE verb detection, so the verb lands back at
+	// position 1 and the per-verb positional parsing (`arg(&args, 2, ...)`) is
+	// unaffected by where the flag was placed. The strip is pure arg math — the
+	// no-board-opened property of the usage path below is untouched; the resolved
+	// path is only *printed* there, never opened.
+	let mut db_flag: Option<String> = None;
+	let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
+	let mut i = 0;
+	while i < raw_args.len() {
+		if raw_args[i] == "--db" && i + 1 < raw_args.len() {
+			db_flag = Some(raw_args[i + 1].clone());
+			i += 2;
+		} else {
+			args.push(raw_args[i].clone());
+			i += 1;
+		}
+	}
 	let cmd = args.get(1).map(String::as_str).unwrap_or("");
+	let db = db_path(db_flag.as_deref(), std::env::var("HARNESS_DB").ok().as_deref());
 	if !known_verb(cmd) {
 		eprintln!(
 			"usage: agent <new|draft|plan|criteria|validation|note|confusion|align|edge|run|sprint|explore|harden|verify|land|close|show|board|ready|status|trajectory|rework|remember|recall|recall-body|gate|close-check|wiki> ...\n\
+			 usage: agent --db <path> <verb> ...      global flag; beats HARNESS_DB for this run\n\
+			 board db: {db}\n\
 			 see the module header for the full command list"
 		);
 		std::process::exit(2);
 	}
-	let db = std::env::var("HARNESS_DB").unwrap_or_else(|_| "harness-board.db".into());
 	let board = Board::open(&db)?;
 
 	match cmd {
@@ -2076,6 +2108,47 @@ fn is_vacuous_pass(combined: &str) -> bool {
 		|| combined.contains("collected 0 items")  // pytest: nothing collected (also exits 0)
 }
 
+/// One place for "run this script through the system shell": `bash -c` on Unix;
+/// on Windows, Git Bash's `bash.exe` when it is on PATH (so the existing bash
+/// acceptance scripts keep working), else `cmd /C`. Both shell sites — the
+/// validation runs here and the worker `bash` tool in tools.rs — route through
+/// this helper so the two cannot drift apart per-platform.
+pub(crate) fn shell_command(script: &str) -> std::process::Command {
+	#[cfg(windows)]
+	{
+		windows_shell(script, bash_on_path())
+	}
+	#[cfg(not(windows))]
+	{
+		let mut command = std::process::Command::new("bash");
+		command.arg("-c").arg(script);
+		command
+	}
+}
+
+/// The Windows branch, parameterized on the PATH probe so the `cmd /C` fallback
+/// shape is assertable without mutating the process environment (an unsafe call
+/// in edition 2024).
+#[cfg(windows)]
+fn windows_shell(script: &str, bash_available: bool) -> std::process::Command {
+	if bash_available {
+		let mut command = std::process::Command::new("bash");
+		command.arg("-c").arg(script);
+		return command;
+	}
+	let mut command = std::process::Command::new("cmd");
+	command.arg("/C").arg(script);
+	command
+}
+
+/// Whether `bash.exe` (Git Bash) is on PATH — Windows-only, where the shell
+/// choice actually branches.
+#[cfg(windows)]
+fn bash_on_path() -> bool {
+	std::env::var_os("PATH")
+		.is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join("bash.exe").is_file()))
+}
+
 /// Run a validation command in `cwd` and return `(passed, exit_code, combined
 /// stdout+stderr)`. Pure I/O — touches NO board state — so both `run_verify` (the
 /// spine gate) and `explore`'s per-worker check (which must NOT mutate the spine,
@@ -2083,9 +2156,7 @@ fn is_vacuous_pass(combined: &str) -> bool {
 /// exits success but collected zero tests is forced to FAIL here (see `is_vacuous_pass`)
 /// so the vacuous pass is closed for BOTH callers at the single shared gate.
 fn run_validation(cmd: &str, cwd: &std::path::Path) -> Result<(bool, i32, String)> {
-	let out = std::process::Command::new("bash")
-		.arg("-c")
-		.arg(cmd)
+	let out = shell_command(cmd)
 		.current_dir(cwd)
 		.output()
 		.with_context(|| format!("running validation: {cmd}"))?;
@@ -3273,6 +3344,39 @@ mod tests {
 		b.set_status(id, Status::Align).unwrap();
 		b.report_gate(id, board::GATE_CRITERIA_CONFIRMED, "gary", GateSource::Human, true, None).unwrap();
 		b.set_status(id, Status::InProgress).unwrap();
+	}
+
+	// The db resolver: --db beats HARNESS_DB, HARNESS_DB beats the repo-default.
+	// Pure on its arguments so all three branches are pinned without touching the
+	// process environment.
+	#[test]
+	fn db_path_flag_beats_env_beats_default() {
+		assert_eq!(db_path(Some("/f.db"), Some("/e.db")), "/f.db", "the --db flag wins over the env");
+		assert_eq!(db_path(None, Some("/e.db")), "/e.db", "the env is used when no flag is given");
+		assert_eq!(db_path(None, None), "harness-board.db", "both absent keeps the repo default");
+		assert_eq!(db_path(Some(""), Some("/e.db")), "", "an explicit empty flag is passed through as given");
+	}
+
+	// The shell helper on this host: program `bash`, args exactly ["-c", script].
+	#[test]
+	#[cfg(not(windows))]
+	fn shell_command_is_bash_dash_c() {
+		let command = shell_command("echo hi");
+		assert_eq!(command.get_program(), std::ffi::OsStr::new("bash"));
+		let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+		assert_eq!(args, vec![std::ffi::OsStr::new("-c"), std::ffi::OsStr::new("echo hi")]);
+	}
+
+	// The Windows cmd fallback shape (bash.exe absent): program `cmd`, args
+	// ["/C", script] — asserted via the parameterized branch so the test does not
+	// depend on whether Git Bash happens to be on this machine's PATH.
+	#[test]
+	#[cfg(windows)]
+	fn shell_command_falls_back_to_cmd_when_bash_absent() {
+		let command = windows_shell("dir", false);
+		assert_eq!(command.get_program(), std::ffi::OsStr::new("cmd"));
+		let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+		assert_eq!(args, vec![std::ffi::OsStr::new("/C"), std::ffi::OsStr::new("dir")]);
 	}
 
 	// The pre-open dispatch gate: main() consults known_verb BEFORE Board::open, so

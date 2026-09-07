@@ -100,6 +100,9 @@ target/release/agent new "first ticket" --kind build
 Credentials are never baked: oMLX key via `OMLX_API_KEY` or `~/.omlx/settings.json`
 (`auth.api_key`); DeepSeek reviewer (optional, advisory) via `DEEPSEEK_API_KEY`.
 
+Every invocation also accepts a global `--db <path>` flag (before or after the verb)
+that overrides `HARNESS_DB` for that run.
+
 This is a **personal** harness — local-first, hardware-specific, opinionated by design. Published
 as a working artifact to read and mine, not as a supported product.
 

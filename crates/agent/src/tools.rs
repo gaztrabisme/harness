@@ -12,7 +12,6 @@
 //! hard sandbox (it can `cd`/use absolute paths) — see the note on its arm.
 
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use provider::ToolDef;
@@ -151,9 +150,7 @@ pub fn execute(name: &str, args: &Value, cwd: &std::path::Path) -> Result<String
 			// sandbox — a command can still `cd` or use absolute paths to escape.
 			// The file tools are confined (see `confine`); fully confining bash
 			// needs OS-level isolation (container/chroot) — deferred.
-			let out = Command::new("bash")
-				.arg("-c")
-				.arg(&command)
+			let out = crate::shell_command(&command)
 				.current_dir(cwd)
 				.output()
 				.with_context(|| format!("bash: {command}"))?;

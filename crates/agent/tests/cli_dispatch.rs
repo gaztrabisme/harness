@@ -188,3 +188,73 @@ fn json_flags_on_board_show_status_emit_the_machine_contract() {
 		"text output must stay byte-identical when --json is absent"
 	);
 }
+
+// The `--db` global flag routes the board path through one resolver where the
+// flag beats the HARNESS_DB env, the env beats the repo default, and the flag is
+// legal before or after the verb. Portability for the pi board extension on
+// Windows: it passes --db explicitly instead of relying on a per-shell exported
+// env var.
+#[test]
+fn db_flag_beats_harness_db_env_before_or_after_the_verb() {
+	let dir = fresh_dir("db-flag");
+	let env_db = dir.join("env.db");
+	let flag_db = dir.join("flag.db");
+
+	// Flag before the verb, env also set: the flag wins, the env db is untouched.
+	let out = run_agent(&dir, &["--db", flag_db.to_str().unwrap(), "board"], Some(&env_db));
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(out.status.success(), "`--db <path> board` must succeed, stderr: {stderr}");
+	assert!(flag_db.exists(), "--db must win over HARNESS_DB");
+	assert!(!env_db.exists(), "HARNESS_DB must be ignored when --db is given");
+
+	// Flag after the verb: same routing, no reordering needed by the caller.
+	let flag_after = dir.join("flag-after.db");
+	let out = run_agent(&dir, &["board", "--db", flag_after.to_str().unwrap()], Some(&env_db));
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(out.status.success(), "`board --db <path>` must succeed, stderr: {stderr}");
+	assert!(flag_after.exists(), "--db after the verb must still win over HARNESS_DB");
+	assert!(!env_db.exists(), "HARNESS_DB must still be ignored");
+}
+
+#[test]
+fn harness_db_env_used_when_no_flag_and_repo_default_when_neither() {
+	// No flag, env set: the env var is the board path.
+	let dir = fresh_dir("db-env");
+	let env_db = dir.join("env.db");
+	let out = run_agent(&dir, &["board"], Some(&env_db));
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(out.status.success(), "`board` must succeed, stderr: {stderr}");
+	assert!(env_db.exists(), "with no --db, HARNESS_DB is the board path");
+
+	// Neither flag nor env: the repo-default `harness-board.db` lands in cwd.
+	let dir = fresh_dir("db-default");
+	let out = run_agent(&dir, &["board"], None);
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(out.status.success(), "`board` must succeed, stderr: {stderr}");
+	assert!(
+		dir.join("harness-board.db").exists(),
+		"with neither source, the default harness-board.db is created in cwd"
+	);
+}
+
+// The usage path prints the path it WOULD have used — resolved through the same
+// --db > env > default order — while keeping the pre-existing property that it
+// opens nothing (no db file is created).
+#[test]
+fn usage_text_prints_the_resolved_db_path_without_opening_it() {
+	let dir = fresh_dir("db-usage");
+
+	// Unknown verb with --db: usage exits 2 and names the flag-resolved path.
+	let out = run_agent(&dir, &["--db", "usage-flag.db", "frobnicate"], None);
+	assert_eq!(out.status.code(), Some(2), "unknown verb must exit 2");
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(stderr.contains("usage-flag.db"), "usage must print the --db-resolved path, got: {stderr}");
+	assert!(!dir.join("usage-flag.db").exists(), "the usage path must not create the db");
+
+	// Bare `agent` with only the env set: the usage text resolves from the env.
+	let out = run_agent(&dir, &[], Some(Path::new("usage-env.db")));
+	assert_eq!(out.status.code(), Some(2), "bare `agent` must exit 2");
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(stderr.contains("usage-env.db"), "usage must print the env-resolved path, got: {stderr}");
+	assert!(!dir.join("usage-env.db").exists(), "the usage path must not create the db");
+}
