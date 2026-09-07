@@ -33,6 +33,8 @@
 //!   agent gate <id> <name> pass|fail [--note T] [--json]                      record a machine gate row (provider `board`)
 //!   agent close-check [--json]                                                exit 0 iff every open ticket has a passing wiki-close gate today
 //!   agent wiki check [--root DIR] [--json]                                    numeric wiki housekeeping gate (port of bin/wiki-check)
+//!   agent pi prepare --template D --agent-dir D --cwd D [--stamp S] [--version V]   the four launcher steps: seed the agent
+//!     [--bppc-host H] [--omlx-key-env VAR] [--allow-any-dir] [--no-wiki] [--json]    dir, render models.json, root guard, wiki init
 //!
 //! The human gate composes with the tool gate: mutating tools stay denied until
 //! the ticket reaches `in_progress`, which requires the human `criteria_confirmed`
@@ -45,6 +47,7 @@ mod explore;
 mod gate;
 mod git;
 mod loopgate;
+mod pi;
 mod planexec;
 mod recorder;
 mod refeed;
@@ -141,6 +144,8 @@ const KNOWN_VERBS: &[&str] = &[
 	"new", "draft", "plan", "criteria", "validation", "note", "confusion", "align", "rework", "show",
 	"status", "trajectory", "ready", "board", "run", "explore", "edge", "sprint", "verify", "review",
 	"harden", "land", "close", "remember", "recall", "recall-body", "gate", "close-check", "wiki",
+	// `pi` is dispatched pre-open too (its subverbs never touch the board).
+	"pi",
 ];
 
 fn known_verb(cmd: &str) -> bool {
@@ -183,12 +188,18 @@ async fn main() -> Result<()> {
 	let db = db_path(db_flag.as_deref(), std::env::var("HARNESS_DB").ok().as_deref());
 	if !known_verb(cmd) {
 		eprintln!(
-			"usage: agent <new|draft|plan|criteria|validation|note|confusion|align|edge|run|sprint|explore|harden|verify|land|close|show|board|ready|status|trajectory|rework|remember|recall|recall-body|gate|close-check|wiki> ...\n\
+			"usage: agent <new|draft|plan|criteria|validation|note|confusion|align|edge|run|sprint|explore|harden|verify|land|close|show|board|ready|status|trajectory|rework|remember|recall|recall-body|gate|close-check|wiki|pi> ...\n\
 			 usage: agent --db <path> <verb> ...      global flag; beats HARNESS_DB for this run\n\
 			 board db: {db}\n\
 			 see the module header for the full command list"
 		);
 		std::process::exit(2);
+	}
+	// `pi` subverbs never touch the board: dispatched before the open so a
+	// launcher call (`agent pi prepare`, unit D4a) from any cwd leaves no
+	// harness-board.db{,-shm,-wal} side-files behind.
+	if cmd == "pi" {
+		std::process::exit(pi::cli(&args));
 	}
 	let board = Board::open(&db)?;
 
@@ -3390,7 +3401,7 @@ mod tests {
 			"new", "draft", "plan", "criteria", "validation", "note", "confusion", "align", "rework",
 			"show", "status", "trajectory", "ready", "board", "run", "explore", "edge", "sprint",
 			"verify", "review", "harden", "land", "close", "remember", "recall", "recall-body",
-			"gate", "close-check", "wiki",
+			"gate", "close-check", "wiki", "pi",
 		] {
 			assert!(known_verb(v), "dispatch arm {v:?} must pass the pre-open gate");
 		}

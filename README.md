@@ -50,6 +50,43 @@ bash or the sqlite3 CLI:
   ≤ 400 lines / ≤ 4000 tokens / ≤ 24k bytes, index ≤ 120 lines, log ≤ 2000, index ↔ disk,
   facts.md checks): `agent wiki check --root . --json`
 
+## Session preparation: `agent pi prepare`
+
+The four local launcher steps (seed the agent directory, render `models.json`, the project-root
+guard, wiki init) have one implementation, this verb; launchers and apps call it, they do not copy
+it. Cross-platform, no bash, no sqlite3.
+
+```bash
+agent pi prepare \
+  --template "$AGENT_TEMPLATE_DIR" \
+  --agent-dir "$AGENT_DIR" \
+  --cwd "$PROJECT_DIR" \
+  [--stamp S] [--version V] \
+  [--bppc-host H] [--omlx-key-env VAR] \
+  [--allow-any-dir] [--no-wiki] [--json]
+```
+
+- **Seed** copies the managed set (`AGENTS.md`, `settings.json`, `settings.README.md`,
+  `models.json.tmpl`, `agents/`, `extensions/`, `prompts/`, `skills/`) into the agent dir. User
+  files (`auth.json`, `models.json`, `mcp.json`, `sessions/`, `logs/`, `wiki/`, `agent-hub/`,
+  `tool-output-artifacts/`) are never touched. A re-seed happens only when the stamp differs;
+  the stamp is the FNV hash of the template tree (prefixed by `--version`, or given outright via
+  `--stamp`). When `--agent-dir` equals `--template`, seeding is skipped and the dir is used in
+  place (the checkout case).
+- **Render** writes `<agent-dir>/models.json` from `models.json.tmpl`, replacing `__BPPC_HOST__`
+  (blank host defaults to `127.0.0.1`) and `__OMLX_KEY__`. The key comes from the env var named by
+  `--omlx-key-env` (default `OMLX_API_KEY`), falling back to `auth.api_key` in
+  `$HOME/.omlx/settings.json`. The key is never printed, in any mode.
+- **Root guard**: `--cwd` must hold `.git` (any kind), `CLAUDE.md`, `AGENTS.md` or `wiki/`,
+  unless `--allow-any-dir`.
+- **Wiki init**: creates `wiki/index.md`, `active-work.md`, `decisions.md` and `log.md` under the
+  cwd, each only when missing; `--no-wiki` skips.
+
+Progress prints `[k/4] name ... OK|FAIL|SKIPPED (detail)` lines on stderr; `--json` adds one
+object on stdout (`steps`, `agentDir`, `modelsJson` as a path, `env.PI_CODING_AGENT_DIR`). Exit
+codes: `0` when every step is OK or SKIPPED, `9` when the root guard fails, `6` on any other
+failure, `2` on a usage error.
+
 ## Does it work?
 
 Graduated to daily-driver status after a measured trial: 5 real tickets on a production project
