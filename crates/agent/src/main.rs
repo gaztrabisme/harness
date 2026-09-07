@@ -3559,6 +3559,9 @@ mod tests {
 
 	// verify: a green validation advances to review; a red one bounces back to
 	// in_progress (the §4 verify-miss back-edge). No oMLX needed.
+	// runs its validations (`true`/`false`) through the system shell (`bash -c`
+	// here) — a runtime-only shell assumption, so the whole test is skipped on Windows.
+	#[cfg(unix)]
 	#[test]
 	fn verify_green_advances_red_bounces() {
 		let cwd = std::env::temp_dir();
@@ -3605,6 +3608,9 @@ mod tests {
 	// (not the stale one) is what ran. A third arm pins that every OTHER status still
 	// refuses, naming both accepted states. No oMLX; a plain temp cwd (not a repo), so the
 	// git-dependent floors degrade to skipped — they get their own test below.
+	// runs the amended validations (`echo …`, `false`) through the system shell —
+	// unix-only like the other shell-executing tests.
+	#[cfg(unix)]
 	#[test]
 	fn verify_reruns_a_review_band_ticket() {
 		let dir = std::env::temp_dir().join("harness-reverify");
@@ -3861,6 +3867,8 @@ mod tests {
 	/// Fake `claude` binary: a shell script that ignores its args, prints the scripted
 	/// stream, and exits `code` — the delegated-worker glue runs hermetically (no
 	/// network, no real CC). The `ScriptedProvider` trick, process-shaped.
+	/// Unix-only: it writes a `#!/bin/sh` script and chmods it — skipped on Windows.
+	#[cfg(unix)]
 	fn fake_claude(dir: &Path, script_body: &str) -> String {
 		let p = dir.join("fake-claude.sh");
 		std::fs::write(&p, format!("#!/bin/sh\n{script_body}\n")).unwrap();
@@ -3889,6 +3897,7 @@ mod tests {
 		WorkerCfg { bin, timeout_secs, max_turns: 40, model: None }
 	}
 
+	#[cfg(unix)]
 	#[tokio::test]
 	async fn claude_worker_success_labels_completed_and_records() {
 		let dir = worker_repo("ok");
@@ -3915,6 +3924,7 @@ exit 0"#,
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
+	#[cfg(unix)]
 	#[tokio::test]
 	async fn claude_worker_garbage_and_is_error_label_error() {
 		let dir = worker_repo("err");
@@ -3936,6 +3946,7 @@ exit 0"#,
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
+	#[cfg(unix)]
 	#[tokio::test]
 	async fn claude_worker_wall_clock_timeout_labels_timeout() {
 		let dir = worker_repo("to");
@@ -3967,6 +3978,7 @@ exit 0"#,
 	// aligned-but-blocked ticket is never dispatched (no run row, still
 	// in_progress); the todo ticket stays on the align side. cwd is swapped
 	// (run_harden/run_verify resolve the repo from it) under the shared lock.
+	#[cfg(unix)]
 	#[allow(clippy::await_holding_lock)]
 	#[tokio::test]
 	async fn sprint_parks_runnable_at_review_and_skips_blocked() {
@@ -4043,6 +4055,10 @@ exit 0"#,
 	// The floor's other side: a branch carrying a committed change verifies exactly as
 	// before — green reaches review, red bounces to in_progress. Same hermetic repo,
 	// one worktree per ticket.
+	// the committed change passes the empty-diff floor, so verify RUNS the validation
+	// (`true`/`false` through the system shell) — unix-only like the other
+	// shell-executing tests.
+	#[cfg(unix)]
 	#[test]
 	fn verify_with_committed_change_behaves_as_before() {
 		let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
