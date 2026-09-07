@@ -67,6 +67,14 @@ cargo build --release -p agent
 
 The binary lands at `target/release/agent` (`target/release/agent.exe` on Windows).
 
+## Releases
+
+Releases are automated: push a `vX.Y.Z` tag on `main` and GitHub Actions builds the `agent` binary
+for every supported platform and attaches it to the tag's release. Assets are named
+`agent-<target-triple>[.exe]` plus a combined `SHA256SUMS` checksum file. The five targets:
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `aarch64-apple-darwin`,
+`x86_64-apple-darwin`, `x86_64-pc-windows-msvc`.
+
 ## Setup
 
 ```bash
