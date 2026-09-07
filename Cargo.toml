@@ -24,7 +24,7 @@ similar = "3.1.0"
 tokio = { version = "1", features = ["full"] }
 libc = "0.2"
 parking_lot = "0.12.5"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Storage_ProjectedFileSystem", "Win32_System_Com", "Win32_System_LibraryLoader"] }
 
 # spike deps (added as crates land)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

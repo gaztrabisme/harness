@@ -339,6 +339,23 @@ impl Board {
 		)?)
 	}
 
+	/// The pi board extension's close predicate, lifted verbatim from its bash
+	/// shim: ids of every open (non-done) ticket lacking a PASSING `wiki-close`
+	/// gate row dated today (UTC). A red does not satisfy — only today's pass
+	/// does, regardless of attempt or latest-wins (`wiki-close` is a
+	/// housekeeping gate, not a spine gate, so rework epochs don't apply; this
+	/// is the shim's contract, kept byte-for-byte).
+	pub fn close_check_missing(&self) -> Result<Vec<String>> {
+		let mut stmt = self.conn.prepare(
+			"SELECT id FROM ticket WHERE status <> 'done' AND id NOT IN (
+			     SELECT issue_id FROM gate_results
+			      WHERE gate = 'wiki-close' AND passed = 1 AND date(created_at) = date('now'))
+			 ORDER BY id",
+		)?;
+		let rows = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+		Ok(rows)
+	}
+
 	/// The required gates for `t.status -> to` that are NOT satisfied at the
 	/// ticket's current attempt (the gate verdicts `set_status` enforces).
 	fn missing_gates(&self, t: &Ticket, to: Status) -> Result<Vec<String>> {

@@ -28,6 +28,11 @@
 //!   agent recall "<query>" [--k N --project P --scope SC]                     lexical recall (index)
 //!   agent recall-body <memory-id>                                             fetch a memory's body
 //!
+//! Machine-facing verbs the pi board extension drives (no bash, no sqlite3):
+//!   agent gate <id> <name> pass|fail [--note T] [--json]                      record a machine gate row (provider `board`)
+//!   agent close-check [--json]                                                exit 0 iff every open ticket has a passing wiki-close gate today
+//!   agent wiki check [--root DIR] [--json]                                    numeric wiki housekeeping gate (port of bin/wiki-check)
+//!
 //! The human gate composes with the tool gate: mutating tools stay denied until
 //! the ticket reaches `in_progress`, which requires the human `criteria_confirmed`
 //! pass — so `agent run` on an un-aligned ticket refuses up front.
@@ -46,6 +51,7 @@ mod researcher;
 mod review;
 mod sprint;
 mod tools;
+mod wikicheck;
 mod worker;
 
 use anyhow::{Context, Result, bail};
@@ -133,7 +139,7 @@ const RESEARCHER_TIMEOUT_SECS: u64 = 25;
 const KNOWN_VERBS: &[&str] = &[
 	"new", "draft", "plan", "criteria", "validation", "note", "confusion", "align", "rework", "show",
 	"status", "trajectory", "ready", "board", "run", "explore", "edge", "sprint", "verify", "review",
-	"harden", "land", "close", "remember", "recall", "recall-body",
+	"harden", "land", "close", "remember", "recall", "recall-body", "gate", "close-check", "wiki",
 ];
 
 fn known_verb(cmd: &str) -> bool {
@@ -146,7 +152,7 @@ async fn main() -> Result<()> {
 	let cmd = args.get(1).map(String::as_str).unwrap_or("");
 	if !known_verb(cmd) {
 		eprintln!(
-			"usage: agent <new|draft|plan|criteria|validation|note|confusion|align|edge|run|sprint|explore|harden|verify|land|close|show|board|ready|status|trajectory|rework|remember|recall|recall-body> ...\n\
+			"usage: agent <new|draft|plan|criteria|validation|note|confusion|align|edge|run|sprint|explore|harden|verify|land|close|show|board|ready|status|trajectory|rework|remember|recall|recall-body|gate|close-check|wiki> ...\n\
 			 see the module header for the full command list"
 		);
 		std::process::exit(2);
@@ -380,6 +386,93 @@ async fn main() -> Result<()> {
 					eprintln!("no live memory {id}");
 					std::process::exit(1);
 				}
+			}
+		}
+		"gate" => {
+			// The pi board extension's gate verb — what its bash shim did with
+			// direct sqlite3 inserts, now through the Rust API: provider 'board',
+			// source 'machine', at the ticket's current attempt. Legal for any
+			// gate outside spine's human-only list ('wiki-close' is one); a human
+			// gate would be refused inside report_gate.
+			let id = arg(&args, 2, "gate <id> <name> pass|fail [--note <text>] [--json]")?;
+			let name = arg(&args, 3, "gate <id> <name> pass|fail [--note <text>] [--json]")?;
+			let passed = match arg(&args, 4, "gate <id> <name> pass|fail [--note <text>] [--json]")?.as_str() {
+				"pass" => true,
+				"fail" => false,
+				other => bail!("verdict must be pass|fail (got {other:?})"),
+			};
+			let note = flag(&args, "--note");
+			// a typo'd id must refuse loudly (exit 2, like the shim) — never
+			// record a gate row against nothing.
+			let t = match board.get(&id) {
+				Ok(t) => t,
+				Err(_) => {
+					eprintln!("gate: no ticket {id} in {db}");
+					std::process::exit(2);
+				}
+			};
+			board.report_gate(&id, &name, "board", GateSource::Machine, passed, note.as_deref())?;
+			if has_flag(&args, "--json") {
+				println!(
+					"{}",
+					serde_json::to_string_pretty(&json!({
+						"id": t.id,
+						"gate": name,
+						"passed": passed,
+						"attempt": t.attempt,
+					}))?
+				);
+			} else {
+				let verdict = if passed { "pass" } else { "fail" };
+				println!("{id}  gate {name}={verdict} recorded");
+			}
+		}
+		"close-check" => {
+			// The pi board extension's close predicate (board::close_check_missing,
+			// the shim's SQL verbatim): exit 0 iff every open ticket has a PASSING
+			// wiki-close gate dated today (UTC). A red does not satisfy.
+			let missing = board.close_check_missing()?;
+			let ok = missing.is_empty();
+			if has_flag(&args, "--json") {
+				println!("{}", serde_json::to_string_pretty(&json!({ "ok": ok, "missing": missing }))?);
+			} else if ok {
+				println!("close-check OK");
+			} else {
+				println!("close-check FAIL — no wiki-close gate today: {}", missing.join(" "));
+			}
+			// the exit code is the contract in BOTH modes (the shim's semantics
+			// don't depend on the output shape)
+			if !ok {
+				std::process::exit(1);
+			}
+		}
+		"wiki" => {
+			// `wiki check` — the Rust port of efficient-pi's bin/wiki-check
+			// (wikicheck.rs): same checks, thresholds and exit code. Only the
+			// `check` subcommand exists today.
+			if args.get(2).map(String::as_str) != Some("check") {
+				bail!("usage: agent wiki check [--root <dir>] [--json]");
+			}
+			let root = match flag(&args, "--root") {
+				Some(r) => std::path::PathBuf::from(r),
+				None => std::env::current_dir()?,
+			};
+			let report = wikicheck::run(&root);
+			if has_flag(&args, "--json") {
+				let checks = report
+					.checks
+					.iter()
+					.map(|c| json!({ "name": c.name, "ok": c.ok, "measured": c.measured, "limit": c.limit }))
+					.collect::<Vec<Value>>();
+				println!("{}", serde_json::to_string_pretty(&json!({ "ok": report.ok, "checks": checks }))?);
+			} else {
+				for c in &report.checks {
+					println!("{}", wikicheck::line(c));
+				}
+				println!("{}", if report.ok { "HOUSEKEEPING-PASS" } else { "HOUSEKEEPING-FAIL" });
+			}
+			if !report.ok {
+				std::process::exit(1);
 			}
 		}
 		// the pre-open known_verb gate already exited on anything else
@@ -3193,6 +3286,7 @@ mod tests {
 			"new", "draft", "plan", "criteria", "validation", "note", "confusion", "align", "rework",
 			"show", "status", "trajectory", "ready", "board", "run", "explore", "edge", "sprint",
 			"verify", "review", "harden", "land", "close", "remember", "recall", "recall-body",
+			"gate", "close-check", "wiki",
 		] {
 			assert!(known_verb(v), "dispatch arm {v:?} must pass the pre-open gate");
 		}

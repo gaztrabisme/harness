@@ -36,6 +36,20 @@ to main                               must exit 0         score ≥ 0.70 or boun
 - **Oracles**: operator-authored `scripts/check_*.py` acceptance checks that workers cannot edit.
 - **Memory**: `agent remember`/`recall` — lessons stored per-board auto-prime future workers.
 
+## Verbs for the pi board extension
+
+Machine-facing verbs so a pi extension can drive the board on macOS, Linux and Windows without
+bash or the sqlite3 CLI:
+
+- `agent gate <id> <name> pass|fail [--note T] [--json]` — record a gate row (provider `board`,
+  machine source; `wiki-close` is a housekeeping gate, not a human keystone):
+  `agent gate t1 wiki-close pass --note "log updated"`
+- `agent close-check [--json]` — exit 0 iff every open ticket has a passing `wiki-close` gate
+  dated today: `agent close-check --json`
+- `agent wiki check [--root DIR] [--json]` — the numeric wiki housekeeping gate (active-work
+  ≤ 400 lines / ≤ 4000 tokens / ≤ 24k bytes, index ≤ 120 lines, log ≤ 2000, index ↔ disk,
+  facts.md checks): `agent wiki check --root . --json`
+
 ## Does it work?
 
 Graduated to daily-driver status after a measured trial: 5 real tickets on a production project
