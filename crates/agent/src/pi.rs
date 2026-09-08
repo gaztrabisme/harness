@@ -15,15 +15,15 @@
 //!                    [--allow-any-dir] [--no-wiki] [--json]
 //!
 //! Steps in launcher order: seed, render, root, wiki. Each prints
-//! `[k/4] name ... OK|FAIL|SKIPPED (detail)` on stderr; `--json` adds one
-//! object on stdout. Exit 0 when every step is OK or SKIPPED, 9 on the root
+//! `[k/4] name ... OK|WARN|FAIL|SKIPPED (detail)` on stderr; `--json` adds one
+//! object on stdout. Exit 0 when every step is OK, WARN or SKIPPED, 9 on the root
 //! guard, 6 on any other failure, 2 on a usage error.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 /// Entries the seed owns in the agent dir; everything else (auth.json,
 /// models.json, mcp.json, sessions/, logs/, wiki/, agent-hub/,
@@ -40,6 +40,9 @@ const MANAGED_DIRS: &[&str] = &["agents", "extensions", "prompts", "skills"];
 /// the app and the bash launcher become callers (unit D4b) without a spurious
 /// re-seed of already-seeded agent dirs.
 const SEED_STAMP_FILE: &str = ".terax-seed";
+/// Per-file baseline for safe reseeding. The stamp says that the template
+/// changed; this manifest says whether a destination file changed by a user.
+const SEED_MANIFEST_FILE: &str = ".terax-seed-manifest";
 
 /// FNV-1a 64-bit: tiny, dependency-free, stable across platforms; good enough
 /// to detect template drift between versions.
@@ -113,12 +116,279 @@ pub struct SeedReport {
     pub updated: Vec<String>,
     /// Managed entries already identical to the template, left untouched.
     pub kept: Vec<String>,
+    /// Managed files whose destination bytes differ from the last seed
+    /// baseline, so the user's edits were preserved.
+    pub kept_edited: Vec<String>,
 }
 
 impl SeedReport {
     fn is_empty(&self) -> bool {
-        self.created.is_empty() && self.updated.is_empty() && self.kept.is_empty()
+        self.created.is_empty()
+            && self.updated.is_empty()
+            && self.kept.is_empty()
+            && self.kept_edited.is_empty()
     }
+}
+
+/// SHA-256 for the seed manifest. This is intentionally self-contained so the
+/// launcher does not add a hashing dependency to the Rust-native core.
+fn sha256_hex(bytes: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    let bit_len = (bytes.len() as u64).wrapping_mul(8);
+    let padded_len = (bytes.len() + 9).div_ceil(64) * 64;
+    let mut padded = Vec::with_capacity(padded_len);
+    padded.extend_from_slice(bytes);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in padded.chunks_exact(64) {
+        let mut schedule = [0u32; 64];
+        for (i, word) in schedule[..16].iter_mut().enumerate() {
+            let start = i * 4;
+            *word = u32::from_be_bytes([
+                chunk[start],
+                chunk[start + 1],
+                chunk[start + 2],
+                chunk[start + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = schedule[i - 15].rotate_right(7)
+                ^ schedule[i - 15].rotate_right(18)
+                ^ (schedule[i - 15] >> 3);
+            let s1 = schedule[i - 2].rotate_right(17)
+                ^ schedule[i - 2].rotate_right(19)
+                ^ (schedule[i - 2] >> 10);
+            schedule[i] = schedule[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(schedule[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut working = state;
+        for i in 0..64 {
+            let s1 = working[4].rotate_right(6)
+                ^ working[4].rotate_right(11)
+                ^ working[4].rotate_right(25);
+            let ch = (working[4] & working[5]) ^ ((!working[4]) & working[6]);
+            let temp1 = working[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(schedule[i]);
+            let s0 = working[0].rotate_right(2)
+                ^ working[0].rotate_right(13)
+                ^ working[0].rotate_right(22);
+            let maj =
+                (working[0] & working[1]) ^ (working[0] & working[2]) ^ (working[1] & working[2]);
+            let temp2 = s0.wrapping_add(maj);
+            working[7] = working[6];
+            working[6] = working[5];
+            working[5] = working[4];
+            working[4] = working[3].wrapping_add(temp1);
+            working[3] = working[2];
+            working[2] = working[1];
+            working[1] = working[0];
+            working[0] = temp1.wrapping_add(temp2);
+        }
+        for (dst, src) in state.iter_mut().zip(working) {
+            *dst = dst.wrapping_add(src);
+        }
+    }
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for word in state {
+        for byte in word.to_be_bytes() {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
+fn manifest_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn managed_template_files(template: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for name in MANAGED_FILES {
+        let rel = PathBuf::from(name);
+        if template.join(&rel).is_file() {
+            files.push(rel);
+        }
+    }
+    for name in MANAGED_DIRS {
+        let dir = template.join(name);
+        if dir.is_dir() {
+            let mut dir_files = Vec::new();
+            collect_files(&dir, Path::new(""), &mut dir_files)?;
+            files.extend(dir_files.into_iter().map(|rel| Path::new(name).join(rel)));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn manifest_contents(template: &Path) -> io::Result<String> {
+    let mut out = String::new();
+    for rel in managed_template_files(template)? {
+        let bytes = fs::read(template.join(&rel))?;
+        out.push_str(&manifest_path(&rel));
+        out.push(' ');
+        out.push_str(&sha256_hex(&bytes));
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn read_seed_manifest(
+    path: &Path,
+) -> io::Result<Option<std::collections::BTreeMap<String, String>>> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut entries = std::collections::BTreeMap::new();
+    for (line_no, line) in raw.lines().enumerate() {
+        let Some((rel, hash)) = line.rsplit_once(' ') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid seed manifest line {} in {}",
+                    line_no + 1,
+                    path.display()
+                ),
+            ));
+        };
+        let valid_hash = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+        if rel.is_empty()
+            || !valid_hash
+            || entries.insert(rel.to_string(), hash.to_string()).is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid seed manifest line {} in {}",
+                    line_no + 1,
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(Some(entries))
+}
+
+fn seed_with_manifest(
+    template: &Path,
+    dest: &Path,
+    previous: &std::collections::BTreeMap<String, String>,
+    report: &mut SeedReport,
+) -> io::Result<()> {
+    for rel in managed_template_files(template)? {
+        let src = template.join(&rel);
+        let dst = dest.join(&rel);
+        let source_bytes = fs::read(&src)?;
+        let rel_name = manifest_path(&rel);
+        if !dst.exists() {
+            copy_file(&src, &dst)?;
+            report.created.push(rel_name);
+            continue;
+        }
+        let current_bytes = fs::read(&dst)?;
+        let unmodified = previous
+            .get(&rel_name)
+            .is_some_and(|hash| hash == &sha256_hex(&current_bytes));
+        if !unmodified {
+            report.kept_edited.push(rel_name);
+        } else if current_bytes == source_bytes {
+            report.kept.push(rel_name);
+        } else {
+            copy_file(&src, &dst)?;
+            report.updated.push(rel_name);
+        }
+    }
+    Ok(())
 }
 
 /// First run copies the whole managed template; later runs re-copy only when
@@ -137,12 +407,18 @@ pub fn seed_agent_dir(template: &Path, dest: &Path, stamp: &str) -> io::Result<S
     }
     fs::create_dir_all(dest)?;
     let mut report = SeedReport::default();
-    for name in MANAGED_FILES {
-        seed_file(template, dest, name, &mut report)?;
+    let previous_manifest = read_seed_manifest(&dest.join(SEED_MANIFEST_FILE))?;
+    if let Some(previous) = previous_manifest.as_ref() {
+        seed_with_manifest(template, dest, previous, &mut report)?;
+    } else {
+        for name in MANAGED_FILES {
+            seed_file(template, dest, name, &mut report)?;
+        }
+        for name in MANAGED_DIRS {
+            seed_dir(template, dest, name, &mut report)?;
+        }
     }
-    for name in MANAGED_DIRS {
-        seed_dir(template, dest, name, &mut report)?;
-    }
+    fs::write(dest.join(SEED_MANIFEST_FILE), manifest_contents(template)?)?;
     fs::write(dest.join(SEED_STAMP_FILE), stamp)?;
     Ok(report)
 }
@@ -218,10 +494,16 @@ fn collect_files(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> io::Result<
     for entry in fs::read_dir(root.join(rel))? {
         let entry = entry?;
         let child = rel.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            collect_files(root, &child, out)?;
-        } else {
-            out.push(child);
+        let is_symlink = entry.file_type()?.is_symlink();
+        match fs::metadata(entry.path()) {
+            // Follow directory symlinks in the template. The real agent
+            // template links skills into the shared skill tree, but the
+            // manifest contains files, never the linked directories.
+            Ok(metadata) if metadata.is_dir() => collect_files(root, &child, out)?,
+            Ok(_) => out.push(child),
+            // A dangling link is neither a file nor a directory to seed.
+            Err(error) if is_symlink && error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -231,14 +513,85 @@ fn collect_files(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> io::Result<
 /// network and the oMLX key is secret.
 const BPPC_HOST_PLACEHOLDER: &str = "__BPPC_HOST__";
 const OMLX_KEY_PLACEHOLDER: &str = "__OMLX_KEY__";
+const OPENROUTER_KEY_PLACEHOLDER: &str = "__OPENROUTER_KEY__";
 /// Blank host: the local machine, so a fresh install never points at another box.
 const BPPC_HOST_LAN: &str = "127.0.0.1";
 
-/// Same substitution as bin/pi-render-models: replaces every placeholder with
-/// the given values, byte for byte (no sed escaping involved).
-pub fn render_models_json(tmpl: &str, bppc_host: &str, omlx_key: &str) -> String {
-    tmpl.replace(BPPC_HOST_PLACEHOLDER, bppc_host)
-        .replace(OMLX_KEY_PLACEHOLDER, omlx_key)
+fn json_escape(value: &str) -> String {
+    let encoded = serde_json::to_string(value).expect("serializing a string cannot fail");
+    encoded[1..encoded.len() - 1].to_string()
+}
+
+/// Same substitution as bin/pi-render-models, with JSON escaping for every
+/// inserted value. An unset OpenRouter key is passed as an empty string.
+pub fn render_models_json(
+    tmpl: &str,
+    bppc_host: &str,
+    omlx_key: &str,
+    openrouter_key: &str,
+) -> String {
+    let bppc_host = json_escape(bppc_host);
+    let omlx_key = json_escape(omlx_key);
+    let openrouter_key = json_escape(openrouter_key);
+    let replacements = [
+        (BPPC_HOST_PLACEHOLDER, bppc_host.as_str()),
+        (OMLX_KEY_PLACEHOLDER, omlx_key.as_str()),
+        (OPENROUTER_KEY_PLACEHOLDER, openrouter_key.as_str()),
+    ];
+    let mut rendered = String::with_capacity(tmpl.len());
+    let mut i = 0;
+    while i < tmpl.len() {
+        if let Some((placeholder, value)) = replacements
+            .iter()
+            .find(|(placeholder, _)| tmpl[i..].starts_with(placeholder))
+        {
+            rendered.push_str(value);
+            i += placeholder.len();
+        } else {
+            let ch = tmpl[i..]
+                .chars()
+                .next()
+                .expect("index is within the template");
+            rendered.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    rendered
+}
+
+fn remaining_placeholders(rendered: &str) -> Vec<String> {
+    let bytes = rendered.as_bytes();
+    let mut placeholders = Vec::new();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] != b'_' || bytes[i + 1] != b'_' || !bytes[i + 2].is_ascii_uppercase() {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 2;
+        while end < bytes.len() {
+            if bytes[end] == b'_' && end + 1 < bytes.len() && bytes[end + 1] == b'_' {
+                break;
+            }
+            if bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_'
+            {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        if end > i + 2 && end + 1 < bytes.len() && bytes[end] == b'_' && bytes[end + 1] == b'_' {
+            let placeholder = rendered[i..end + 2].to_string();
+            if !placeholders.contains(&placeholder) {
+                placeholders.push(placeholder);
+            }
+            i = end + 2;
+        } else {
+            i += 2;
+        }
+    }
+    placeholders.sort();
+    placeholders
 }
 
 /// Writes <agent_dir>/models.json only when the rendered content differs from
@@ -277,17 +630,37 @@ const WIKI_FILES: &[(&str, &str)] = &[
 /// files it created.
 pub fn wiki_init(project_root: &Path) -> io::Result<Vec<PathBuf>> {
     let wiki = project_root.join("wiki");
+    reject_symlink(&wiki, "wiki path")?;
     fs::create_dir_all(&wiki)?;
     let mut created = Vec::new();
     for (name, body) in WIKI_FILES {
         let path = wiki.join(name);
-        if path.exists() {
-            continue;
+        reject_symlink(&wiki, "wiki path")?;
+        reject_symlink(&path, "wiki file")?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                file.write_all(body.as_bytes())?;
+                created.push(path);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                reject_symlink(&path, "wiki file")?;
+            }
+            Err(e) => return Err(e),
         }
-        fs::write(&path, body)?;
-        created.push(path);
     }
     Ok(created)
+}
+
+fn reject_symlink(path: &Path, kind: &str) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("refusing symlinked {kind}: {}", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// The launcher's project-root guard: the cwd must look like a project (.git
@@ -354,6 +727,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepStatus {
     Ok,
+    Warn,
     Fail,
     Skipped,
 }
@@ -363,6 +737,7 @@ impl StepStatus {
     fn label(self) -> &'static str {
         match self {
             StepStatus::Ok => "OK",
+            StepStatus::Warn => "WARN",
             StepStatus::Fail => "FAIL",
             StepStatus::Skipped => "SKIPPED",
         }
@@ -390,6 +765,8 @@ pub struct PrepareOptions {
     /// The resolved oMLX key, or None to fail the render step (the key value
     /// is never included in any detail line).
     pub omlx_key: Option<String>,
+    /// OpenRouter key from OPENROUTER_API_KEY, empty when unset.
+    pub openrouter_key: String,
     /// Env var name the key was resolved from, for the failure message only.
     pub omlx_key_var: String,
     pub allow_any_dir: bool,
@@ -404,8 +781,8 @@ pub struct PrepareOutcome {
 }
 
 /// Composes seed, render, root guard and wiki init in launcher step order.
-/// Every step reports its own outcome; a failed step never aborts the rest,
-/// so the caller sees the full picture in one round-trip.
+/// Every step reports its own outcome; a failed root guard prevents project
+/// writes while the caller still sees the full picture in one round-trip.
 pub fn prepare(opts: PrepareOptions) -> PrepareOutcome {
     let mut steps = Vec::new();
 
@@ -422,40 +799,54 @@ pub fn prepare(opts: PrepareOptions) -> PrepareOutcome {
             .stamp
             .clone()
             .unwrap_or_else(|| default_stamp(opts.version.as_deref(), &opts.template));
-        steps.push(match seed_agent_dir(&opts.template, &opts.agent_dir, &stamp) {
-            Ok(report) if report.is_empty() => Step {
-                name: "seed",
-                status: StepStatus::Ok,
-                detail: format!("agent dir ready at {}", opts.agent_dir.display()),
+        steps.push(
+            match seed_agent_dir(&opts.template, &opts.agent_dir, &stamp) {
+                Ok(report) if report.is_empty() => Step {
+                    name: "seed",
+                    status: StepStatus::Ok,
+                    detail: format!("agent dir ready at {}", opts.agent_dir.display()),
+                },
+                Ok(report) => {
+                    let mut detail = format!(
+                        "seeded {}: {} created, {} updated, {} kept",
+                        opts.agent_dir.display(),
+                        report.created.len(),
+                        report.updated.len(),
+                        report.kept.len()
+                    );
+                    if !report.kept_edited.is_empty() {
+                        detail.push_str(&format!(
+                            "; kept_edited [{}]",
+                            report.kept_edited.join(", ")
+                        ));
+                    }
+                    Step {
+                        name: "seed",
+                        status: StepStatus::Ok,
+                        detail,
+                    }
+                }
+                Err(e) => Step {
+                    name: "seed",
+                    status: StepStatus::Fail,
+                    detail: e.to_string(),
+                },
             },
-            Ok(report) => Step {
-                name: "seed",
-                status: StepStatus::Ok,
-                detail: format!(
-                    "seeded {}: {} created, {} updated, {} kept",
-                    opts.agent_dir.display(),
-                    report.created.len(),
-                    report.updated.len(),
-                    report.kept.len()
-                ),
-            },
-            Err(e) => Step {
-                name: "seed",
-                status: StepStatus::Fail,
-                detail: e.to_string(),
-            },
-        });
+        );
     }
 
     // Step 2: render pi-home agent models.json from the seeded template.
     steps.push(render_step(&opts));
 
     // Step 3: the project-root guard.
-    steps.push(if opts.allow_any_dir {
+    let root_step = if opts.allow_any_dir {
         Step {
             name: "root",
             status: StepStatus::Skipped,
-            detail: format!("root guard skipped (--allow-any-dir): {}", opts.cwd.display()),
+            detail: format!(
+                "root guard skipped (--allow-any-dir): {}",
+                opts.cwd.display()
+            ),
         }
     } else {
         match project_root_check(&opts.cwd) {
@@ -470,10 +861,18 @@ pub fn prepare(opts: PrepareOptions) -> PrepareOutcome {
                 detail: msg,
             },
         }
-    });
+    };
+    let root_failed = root_step.status == StepStatus::Fail;
+    steps.push(root_step);
 
     // Step 4: wiki init.
-    steps.push(if opts.no_wiki {
+    steps.push(if root_failed {
+        Step {
+            name: "wiki",
+            status: StepStatus::Skipped,
+            detail: "wiki init skipped (root guard failed)".to_string(),
+        }
+    } else if opts.no_wiki {
         Step {
             name: "wiki",
             status: StepStatus::Skipped,
@@ -528,7 +927,11 @@ fn render_step(opts: &PrepareOptions) -> Step {
             };
         }
     };
-    let key = opts.omlx_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    let key = opts
+        .omlx_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
     let Some(key) = key else {
         return Step {
             name,
@@ -544,30 +947,51 @@ fn render_step(opts: &PrepareOptions) -> Step {
     } else {
         opts.bppc_host.trim()
     };
-    let rendered = render_models_json(&tmpl, host, key);
-    match write_models_json(&opts.agent_dir, &rendered) {
-        Ok(true) => Step {
-            name,
-            status: StepStatus::Ok,
-            detail: format!("wrote models.json (bppc host {host})"),
-        },
-        Ok(false) => Step {
-            name,
-            status: StepStatus::Ok,
-            detail: format!("models.json unchanged (bppc host {host})"),
-        },
-        Err(e) => Step {
+    let rendered = render_models_json(&tmpl, host, key, &opts.openrouter_key);
+    if let Err(e) = serde_json::from_str::<Value>(&rendered) {
+        return Step {
             name,
             status: StepStatus::Fail,
-            detail: e.to_string(),
-        },
+            detail: format!("rendered models.json is invalid JSON: {e}"),
+        };
+    }
+    let placeholders = remaining_placeholders(&rendered);
+    let detail = match write_models_json(&opts.agent_dir, &rendered) {
+        Ok(true) => format!("wrote models.json (bppc host {host})"),
+        Ok(false) => format!("models.json unchanged (bppc host {host})"),
+        Err(e) => {
+            return Step {
+                name,
+                status: StepStatus::Fail,
+                detail: e.to_string(),
+            };
+        }
+    };
+    if placeholders.is_empty() {
+        Step {
+            name,
+            status: StepStatus::Ok,
+            detail,
+        }
+    } else {
+        Step {
+            name,
+            status: StepStatus::Warn,
+            detail: format!(
+                "{detail}; unresolved placeholders: {}",
+                placeholders.join(", ")
+            ),
+        }
     }
 }
 
-/// Exit-code contract: 0 when every step is OK or SKIPPED, 9 on the root
+/// Exit-code contract: 0 when every step is OK, WARN or SKIPPED, 9 on the root
 /// guard, 6 on any other failure.
 fn exit_code(steps: &[Step]) -> i32 {
-    if steps.iter().any(|s| s.name == "root" && s.status == StepStatus::Fail) {
+    if steps
+        .iter()
+        .any(|s| s.name == "root" && s.status == StepStatus::Fail)
+    {
         9
     } else if steps.iter().any(|s| s.status == StepStatus::Fail) {
         6
@@ -653,8 +1077,16 @@ pub fn cli(args: &[String]) -> i32 {
     // --omlx-key-env VAR first, then the oMLX settings fallback. The value is
     // carried in memory only and never printed, in any mode.
     let explicit = std::env::var(&parsed.omlx_key_env).ok();
-    let home = std::env::var("HOME").ok().or_else(|| std::env::var("USERPROFILE").ok());
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
     let omlx_key = resolve_omlx_key(explicit, home.as_deref());
+    let openrouter_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
     let outcome = prepare(PrepareOptions {
         template: parsed.template,
         agent_dir: parsed.agent_dir,
@@ -664,12 +1096,19 @@ pub fn cli(args: &[String]) -> i32 {
         bppc_host: parsed.bppc_host,
         omlx_key_var: parsed.omlx_key_env,
         omlx_key,
+        openrouter_key,
         allow_any_dir: parsed.allow_any_dir,
         no_wiki: parsed.no_wiki,
     });
 
     for (i, step) in outcome.steps.iter().enumerate() {
-        eprintln!("[{}/4] {} ... {} ({})", i + 1, step.name, step.status.label(), step.detail);
+        eprintln!(
+            "[{}/4] {} ... {} ({})",
+            i + 1,
+            step.name,
+            step.status.label(),
+            step.detail
+        );
     }
     if parsed.json {
         // Paths and step outcomes only: models.json's rendered CONTENT carries
@@ -731,6 +1170,20 @@ mod tests {
         root
     }
 
+    fn real_template_path() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))?;
+        Some(PathBuf::from(home).join("Documents/Work/Lab/efficient-pi/pi-home/agent"))
+    }
+
+    fn two_file_template(name: &str) -> PathBuf {
+        let root = temp_dir(name);
+        write(&root.join("agents/one.md"), "one v1\n");
+        write(&root.join("agents/two.md"), "two v1\n");
+        root
+    }
+
     fn managed_entry_names() -> Vec<String> {
         let mut names: Vec<String> = MANAGED_FILES
             .iter()
@@ -749,7 +1202,12 @@ mod tests {
         names
     }
 
-    fn prepare_opts(template: &Path, agent_dir: &Path, cwd: &Path, omlx_key: Option<&str>) -> PrepareOptions {
+    fn prepare_opts(
+        template: &Path,
+        agent_dir: &Path,
+        cwd: &Path,
+        omlx_key: Option<&str>,
+    ) -> PrepareOptions {
         PrepareOptions {
             template: template.to_path_buf(),
             agent_dir: agent_dir.to_path_buf(),
@@ -758,6 +1216,7 @@ mod tests {
             version: None,
             bppc_host: String::new(),
             omlx_key: omlx_key.map(str::to_owned),
+            openrouter_key: String::new(),
             omlx_key_var: "OMLX_API_KEY".to_string(),
             allow_any_dir: false,
             no_wiki: false,
@@ -775,6 +1234,14 @@ mod tests {
     // --- seed ---
 
     #[test]
+    fn seed_manifest_hash_matches_sha256() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn seed_first_run_copies_everything_and_writes_the_stamp() {
         let tmpl = template("seed-first");
         let dest = temp_dir("seed-first-dest");
@@ -785,7 +1252,10 @@ mod tests {
             fs::read_to_string(dest.join(SEED_STAMP_FILE)).expect("stamp"),
             "v1+abc"
         );
-        assert_eq!(fs::read_to_string(dest.join("AGENTS.md")).expect("agents.md"), "# agent\n");
+        assert_eq!(
+            fs::read_to_string(dest.join("AGENTS.md")).expect("agents.md"),
+            "# agent\n"
+        );
         assert_eq!(
             fs::read_to_string(dest.join("skills/dev/SKILL.md")).expect("skill"),
             "# dev\n"
@@ -801,7 +1271,10 @@ mod tests {
         let agents_before = fs::read(dest.join("AGENTS.md")).expect("read");
         let report = seed_agent_dir(&tmpl, &dest, &stamp).expect("second seed");
         assert!(report.is_empty(), "same stamp must be a no-op");
-        assert_eq!(fs::read(dest.join("AGENTS.md")).expect("read"), agents_before);
+        assert_eq!(
+            fs::read(dest.join("AGENTS.md")).expect("read"),
+            agents_before
+        );
     }
 
     #[test]
@@ -812,7 +1285,7 @@ mod tests {
         write(&dest.join("auth.json"), r#"{"bppc":"secret"}"#);
         write(&tmpl.join("prompts/brief.md"), "# brief v2\n");
         let report = seed_agent_dir(&tmpl, &dest, "v2").expect("re-seed");
-        assert_eq!(report.updated, vec!["prompts/".to_string()]);
+        assert_eq!(report.updated, vec!["prompts/brief.md".to_string()]);
         assert!(report.created.is_empty(), "nothing new on re-seed");
         assert_eq!(
             fs::read_to_string(dest.join("prompts/brief.md")).expect("prompt"),
@@ -823,7 +1296,59 @@ mod tests {
             r#"{"bppc":"secret"}"#,
             "user files are never touched by a re-seed"
         );
-        assert_eq!(fs::read_to_string(dest.join(SEED_STAMP_FILE)).expect("stamp"), "v2");
+        assert_eq!(
+            fs::read_to_string(dest.join(SEED_STAMP_FILE)).expect("stamp"),
+            "v2"
+        );
+    }
+
+    #[test]
+    fn reseed_managed_directory_tracks_each_file() {
+        let tmpl = two_file_template("seed-managed-files");
+        let dest = temp_dir("seed-managed-files-dest");
+        seed_agent_dir(&tmpl, &dest, "v1").expect("first seed");
+        write(&dest.join("agents/one.md"), "user edit\n");
+        write(&tmpl.join("agents/two.md"), "two v2\n");
+
+        let report = seed_agent_dir(&tmpl, &dest, "v2").expect("re-seed");
+        assert_eq!(report.kept_edited, vec!["agents/one.md".to_string()]);
+        assert_eq!(report.updated, vec!["agents/two.md".to_string()]);
+        assert_eq!(
+            fs::read(dest.join("agents/one.md")).expect("edited destination"),
+            b"user edit\n"
+        );
+        assert_eq!(
+            fs::read(dest.join("agents/two.md")).expect("refreshed destination"),
+            b"two v2\n"
+        );
+        let manifest = fs::read_to_string(dest.join(SEED_MANIFEST_FILE)).expect("manifest");
+        for line in manifest.lines() {
+            let (rel, hash) = line.rsplit_once(' ').expect("manifest entry");
+            assert_eq!(hash.len(), 64, "manifest entry has a SHA-256 hash");
+            assert!(
+                dest.join(rel).is_file(),
+                "manifest entry is not a file: {rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_template_seed_smoke_uses_fixture_when_unavailable() {
+        let tmpl = real_template_path()
+            .filter(|path| path.is_dir())
+            .unwrap_or_else(|| template("seed-real-template"));
+        let dest = temp_dir("seed-real-template-dest");
+        seed_agent_dir(&tmpl, &dest, "smoke").expect("real or fixture template seed");
+        let manifest = fs::read_to_string(dest.join(SEED_MANIFEST_FILE)).expect("manifest");
+        assert!(!manifest.is_empty(), "the template has managed files");
+        for line in manifest.lines() {
+            let (rel, hash) = line.rsplit_once(' ').expect("manifest entry");
+            assert_eq!(hash.len(), 64, "manifest entry has a SHA-256 hash");
+            assert!(
+                dest.join(rel).is_file(),
+                "manifest entry is not a file: {rel}"
+            );
+        }
     }
 
     #[test]
@@ -844,9 +1369,13 @@ mod tests {
     fn default_stamp_prefixes_the_hash_only_when_a_version_is_given() {
         let tmpl = template("default-stamp");
         let bare = default_stamp(None, &tmpl);
-        assert_eq!(bare.len(), 16, "no version: the bare 16-hex hash, got {bare}");
+        assert_eq!(
+            bare.len(),
+            16,
+            "no version: the bare 16-hex hash, got {bare}"
+        );
         assert!(bare.chars().all(|c| c.is_ascii_hexdigit()));
-        let versioned = default_stamp(Some("0.7.3", ), &tmpl);
+        let versioned = default_stamp(Some("0.7.3"), &tmpl);
         assert!(versioned.starts_with("0.7.3+") && versioned.ends_with(&bare));
         let blank = default_stamp(Some("  "), &tmpl);
         assert_eq!(blank, bare, "a blank version is no version");
@@ -860,6 +1389,7 @@ mod tests {
             r#"{"baseUrl": "http://__BPPC_HOST__:8080/v1", "apiKey": "__OMLX_KEY__"}"#,
             "100.1.2.3",
             "test-key",
+            "",
         );
         assert_eq!(
             out,
@@ -870,14 +1400,20 @@ mod tests {
     #[test]
     fn write_models_json_skips_identical_content() {
         let dir = temp_dir("write-models");
-        assert!(write_models_json(&dir, "{}").expect("write"), "first write lands");
+        assert!(
+            write_models_json(&dir, "{}").expect("write"),
+            "first write lands"
+        );
         let first = fs::read(dir.join("models.json")).expect("read");
         assert!(
             !write_models_json(&dir, "{}").expect("second write"),
             "identical content must not rewrite"
         );
         assert_eq!(fs::read(dir.join("models.json")).expect("read"), first);
-        assert!(write_models_json(&dir, "[]").expect("third write"), "changed content rewrites");
+        assert!(
+            write_models_json(&dir, "[]").expect("third write"),
+            "changed content rewrites"
+        );
     }
 
     // --- wiki init ---
@@ -896,7 +1432,10 @@ mod tests {
         );
         write(&project.join("wiki/decisions.md"), "user edits\n");
         let second = wiki_init(&project).expect("wiki init again");
-        assert!(second.is_empty(), "no file may be overwritten once it exists");
+        assert!(
+            second.is_empty(),
+            "no file may be overwritten once it exists"
+        );
         assert_eq!(
             fs::read_to_string(project.join("wiki/decisions.md")).expect("decisions"),
             "user edits\n"
@@ -918,7 +1457,10 @@ mod tests {
         for (name, _) in WIKI_FILES {
             let written = fs::read(project.join("wiki").join(name)).expect("written file");
             let fixture = fs::read(fixture_root.join(name)).expect("fixture file");
-            assert_eq!(written, fixture, "{name} must be byte-equal to bin/wiki-init's output");
+            assert_eq!(
+                written, fixture,
+                "{name} must be byte-equal to bin/wiki-init's output"
+            );
         }
     }
 
@@ -956,7 +1498,10 @@ mod tests {
         )
         .expect("write");
         let home_str = home.to_str().expect("utf8");
-        assert_eq!(omlx_key_default(Some(home_str)).as_deref(), Some("settings-key"));
+        assert_eq!(
+            omlx_key_default(Some(home_str)).as_deref(),
+            Some("settings-key")
+        );
         // Whitespace-only keys count as unset, as do blank homes and missing
         // or malformed files: render_step then reports the gap itself.
         fs::write(
@@ -966,7 +1511,11 @@ mod tests {
         .expect("rewrite");
         assert_eq!(omlx_key_default(Some(home_str)), None);
         let empty = temp_dir("key-empty-home");
-        assert_eq!(omlx_key_default(empty.to_str()), None, "missing file must yield None");
+        assert_eq!(
+            omlx_key_default(empty.to_str()),
+            None,
+            "missing file must yield None"
+        );
         assert_eq!(omlx_key_default(Some("   ")), None);
         assert_eq!(omlx_key_default(None), None);
     }
@@ -991,7 +1540,10 @@ mod tests {
             Some("settings-key"),
             "a blank env key falls back to the settings file"
         );
-        assert_eq!(resolve_omlx_key(None, Some(home_str)).as_deref(), Some("settings-key"));
+        assert_eq!(
+            resolve_omlx_key(None, Some(home_str)).as_deref(),
+            Some("settings-key")
+        );
         assert_eq!(resolve_omlx_key(None, None), None, "nothing anywhere: None");
     }
 
@@ -1029,7 +1581,13 @@ mod tests {
             vec!["seed", "render", "root", "wiki"]
         );
         for step in &outcome.steps {
-            assert_eq!(step.status, StepStatus::Ok, "step {} failed: {}", step.name, step.detail);
+            assert_eq!(
+                step.status,
+                StepStatus::Ok,
+                "step {} failed: {}",
+                step.name,
+                step.detail
+            );
         }
         assert_eq!(outcome.agent_dir, agent_dir);
         assert_eq!(outcome.models_json, agent_dir.join("models.json"));
@@ -1039,7 +1597,10 @@ mod tests {
             "the rendered models.json carries the host and key; neither is ever printed"
         );
         assert!(agent_dir.join("AGENTS.md").is_file());
-        assert!(agent_dir.join(SEED_STAMP_FILE).is_file(), "the default stamp is written");
+        assert!(
+            agent_dir.join(SEED_STAMP_FILE).is_file(),
+            "the default stamp is written"
+        );
         assert!(project.join("wiki/index.md").is_file());
     }
 
@@ -1066,7 +1627,19 @@ mod tests {
             StepStatus::Fail,
             "empty project must fail the root guard"
         );
-        assert_eq!(step_named(&outcome, "wiki").status, StepStatus::Ok, "wiki init still runs");
+        assert_eq!(
+            step_named(&outcome, "wiki").status,
+            StepStatus::Skipped,
+            "wiki init is gated by the root check"
+        );
+        assert_eq!(
+            step_named(&outcome, "wiki").detail,
+            "wiki init skipped (root guard failed)"
+        );
+        assert!(
+            !project.join("wiki").exists(),
+            "root failure creates no wiki"
+        );
         assert_eq!(exit_code(&outcome.steps), 9, "the root guard failed here");
     }
 
@@ -1080,16 +1653,28 @@ mod tests {
         opts.allow_any_dir = true;
         let outcome = prepare(opts);
         let render = step_named(&outcome, "render");
-        assert_eq!(render.status, StepStatus::Fail, "blank key must fail render");
+        assert_eq!(
+            render.status,
+            StepStatus::Fail,
+            "blank key must fail render"
+        );
         assert!(
             render.detail.contains("PI_TEST_KEY") && render.detail.contains("cannot render"),
             "the failure names the env var, never the key: {}",
             render.detail
         );
         let root = step_named(&outcome, "root");
-        assert_eq!(root.status, StepStatus::Skipped, "allow_any_dir skips the guard");
+        assert_eq!(
+            root.status,
+            StepStatus::Skipped,
+            "allow_any_dir skips the guard"
+        );
         assert!(root.detail.contains("allow-any-dir"));
-        assert_eq!(exit_code(&outcome.steps), 6, "a render failure exits 6, not 9");
+        assert_eq!(
+            exit_code(&outcome.steps),
+            6,
+            "a render failure exits 6, not 9"
+        );
     }
 
     #[test]
@@ -1098,12 +1683,10 @@ mod tests {
         let agent_dir = temp_dir("prep-idem-agent");
         let project = temp_dir("prep-idem-proj");
         fs::create_dir(project.join(".git")).expect("gitdir");
-        let make_opts = || {
-            PrepareOptions {
-                bppc_host: "10.0.0.9".to_string(),
-                omlx_key: Some("idem-key".to_string()),
-                ..prepare_opts(&tmpl, &agent_dir, &project, None)
-            }
+        let make_opts = || PrepareOptions {
+            bppc_host: "10.0.0.9".to_string(),
+            omlx_key: Some("idem-key".to_string()),
+            ..prepare_opts(&tmpl, &agent_dir, &project, None)
         };
         let first = prepare(make_opts());
         let second = prepare(make_opts());
@@ -1117,7 +1700,9 @@ mod tests {
             step_named(&second, "render").detail
         );
         assert!(
-            step_named(&second, "seed").detail.starts_with("agent dir ready"),
+            step_named(&second, "seed")
+                .detail
+                .starts_with("agent dir ready"),
             "the same default stamp must be a no-op seed: {}",
             step_named(&second, "seed").detail
         );
@@ -1134,9 +1719,16 @@ mod tests {
             ..prepare_opts(&tmpl, &tmpl, &project, None)
         });
         let seed = step_named(&outcome, "seed");
-        assert_eq!(seed.status, StepStatus::Skipped, "the checkout case skips seeding");
+        assert_eq!(
+            seed.status,
+            StepStatus::Skipped,
+            "the checkout case skips seeding"
+        );
         assert!(seed.detail.contains("used in place"));
-        assert!(!tmpl.join(SEED_STAMP_FILE).exists(), "no stamp is written into a checkout");
+        assert!(
+            !tmpl.join(SEED_STAMP_FILE).exists(),
+            "no stamp is written into a checkout"
+        );
         assert_eq!(step_named(&outcome, "render").status, StepStatus::Ok);
         assert!(
             fs::read_to_string(tmpl.join("models.json"))
@@ -1181,24 +1773,72 @@ mod tests {
     #[test]
     fn exit_code_root_guard_failure_beats_other_failures() {
         let steps = vec![
-            Step { name: "seed", status: StepStatus::Fail, detail: String::new() },
-            Step { name: "render", status: StepStatus::Fail, detail: String::new() },
-            Step { name: "root", status: StepStatus::Fail, detail: String::new() },
-            Step { name: "wiki", status: StepStatus::Ok, detail: String::new() },
+            Step {
+                name: "seed",
+                status: StepStatus::Fail,
+                detail: String::new(),
+            },
+            Step {
+                name: "render",
+                status: StepStatus::Fail,
+                detail: String::new(),
+            },
+            Step {
+                name: "root",
+                status: StepStatus::Fail,
+                detail: String::new(),
+            },
+            Step {
+                name: "wiki",
+                status: StepStatus::Ok,
+                detail: String::new(),
+            },
         ];
         assert_eq!(exit_code(&steps), 9, "the root guard dominates");
         let no_root_fail = vec![
-            Step { name: "seed", status: StepStatus::Ok, detail: String::new() },
-            Step { name: "render", status: StepStatus::Fail, detail: String::new() },
-            Step { name: "root", status: StepStatus::Ok, detail: String::new() },
-            Step { name: "wiki", status: StepStatus::Skipped, detail: String::new() },
+            Step {
+                name: "seed",
+                status: StepStatus::Ok,
+                detail: String::new(),
+            },
+            Step {
+                name: "render",
+                status: StepStatus::Fail,
+                detail: String::new(),
+            },
+            Step {
+                name: "root",
+                status: StepStatus::Ok,
+                detail: String::new(),
+            },
+            Step {
+                name: "wiki",
+                status: StepStatus::Skipped,
+                detail: String::new(),
+            },
         ];
         assert_eq!(exit_code(&no_root_fail), 6);
         let clean = vec![
-            Step { name: "seed", status: StepStatus::Skipped, detail: String::new() },
-            Step { name: "render", status: StepStatus::Ok, detail: String::new() },
-            Step { name: "root", status: StepStatus::Skipped, detail: String::new() },
-            Step { name: "wiki", status: StepStatus::Skipped, detail: String::new() },
+            Step {
+                name: "seed",
+                status: StepStatus::Skipped,
+                detail: String::new(),
+            },
+            Step {
+                name: "render",
+                status: StepStatus::Ok,
+                detail: String::new(),
+            },
+            Step {
+                name: "root",
+                status: StepStatus::Skipped,
+                detail: String::new(),
+            },
+            Step {
+                name: "wiki",
+                status: StepStatus::Skipped,
+                detail: String::new(),
+            },
         ];
         assert_eq!(exit_code(&clean), 0, "SKIPPED is success");
     }
